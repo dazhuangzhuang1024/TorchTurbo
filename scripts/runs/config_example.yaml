@@ -18,7 +18,9 @@ engine_config:
 
   parallel_plan:
     sp_size: 1
+    tp_size: 1
     ep_size: 1
+    etp_size: 1
     # Example FQN patches. Adjust these patterns to match the target model.
     plan:
       "model.language_model.layers.*":
@@ -35,6 +37,8 @@ engine_config:
         activation_checkpoint: true
       "**.expert":
         no_shard: true
+
+  gbs: null
 
   mixed_precision: bf16
   use_deterministic_algorithms: false

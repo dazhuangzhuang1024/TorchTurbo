@@ -118,7 +118,7 @@ Both training scripts share the same set of basic variables:
 | `SEQ_LEN` | `4096` | Training sequence length, adjusted according to memory and data length |
 | `FINETUNING_TYPE` | `full` | Finetuning type; only supports `full` and `lora` |
 | `DATASET` | `gsm8k` | Dataset for training. |
-| `TT_CONFIG` | `${SCRIPT_DIR}/lf_text_sft.yaml` | torchturbo engine config file, containing `engine_config.parallel_plan` (sp_size/ep_size), etc. |
+| `TT_CONFIG` | `${SCRIPT_DIR}/lf_text_sft.yaml` | torchturbo engine config file, containing `engine_config.parallel_plan` (sp_size/tp_size/ep_size/etp_size), etc. |
 
 Override the variables as needed when launching:
 

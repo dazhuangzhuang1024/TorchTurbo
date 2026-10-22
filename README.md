@@ -8,7 +8,7 @@ Post-training large models presents several challenges. Model architectures cont
 
 At the same time, AI infrastructure is entering the SuperNode era. The powerful communication capabilities of SuperNodes provide better support for training ultra-large MoE models. Against this backdrop, we introduce TorchTurbo, a distributed training engine centered on model and training logic. TorchTurbo improves model adaptation and training efficiency through deeply optimized fused operators and SuperNode affinity, taking full advantage of low inter-node communication overhead within a SuperNode.
 
-Built on PyTorch FSDP2 and Hugging Face Transformers, TorchTurbo combines **fully sharded data parallelism (FSDP), expert parallelism (EP), and Ulysses sequence parallelism (SP)** to provide flexible and efficient parallel training strategies for multimodal models. Its architecture is shown below:
+Built on PyTorch FSDP2 and Hugging Face Transformers, TorchTurbo combines **fully sharded data parallelism (FSDP), expert parallelism (EP), Ulysses sequence parallelism (SP), tensor parallelism (TP), and expert tensor parallelism (ETP)** to provide flexible and efficient parallel training strategies for multimodal models. Its architecture is shown below:
 
 ![TorchTurbo training architecture](docs/assets/architecture-en.svg)
 
@@ -70,11 +70,15 @@ def get_parallel_plan() -> FSDPParallelPlan:
             ),
         },
         sp_size=1,
+        tp_size=1,
         ep_size=1,
+        etp_size=1,
     )
 ```
 
-The wrapper class returns this plan from `get_default_parallel_plan()`. The engine then merges `EngineConfig.parallel_plan` into it, including runtime `sp_size` and `ep_size` values supplied through environment variables, a configuration file, or CLI arguments.
+The wrapper class returns this plan from `get_default_parallel_plan()`. The engine then merges `EngineConfig.parallel_plan` into it, including runtime `sp_size`, `tp_size`, `ep_size`, and `etp_size` values supplied through environment variables, a configuration file, or CLI arguments.
+
+Tensor parallelism uses `TensorParallelPlanSpec`: `plan` maps module patterns to PyTorch `ParallelStyle` objects, and `validator` is a model-provided `TensorParallelValidator`.
 
 Vision balancing is configured on a compatible module's plan entry. For Bailing
 V3 VL, enable it on `model.visual` in the file passed to `--tt_config`:
@@ -239,7 +243,7 @@ Before running a script, you will typically need to check:
 - `output_dir`
 - TorchTurbo's `PYTHONPATH`
 - `NNODES` / `NPUS_PER_NODE` / `MASTER_ADDR` / `MASTER_PORT`
-- `TORCH_TURBO_SP_SIZE` / `TORCH_TURBO_EP_SIZE` (or `--tt_sp_size` / `--tt_ep_size`)
+- `TORCH_TURBO_SP_SIZE` / `TORCH_TURBO_TP_SIZE` / `TORCH_TURBO_EP_SIZE` / `TORCH_TURBO_ETP_SIZE` (or `--tt_sp_size` / `--tt_tp_size` / `--tt_ep_size` / `--tt_etp_size`)
 - `TORCH_TURBO_GRADIENT_CHECKPOINTING` / `--tt_gradient_checkpointing`
 - `--tt_cpu_offload` or `backend_config.cpu_offload` in the `--tt_config` file
 
@@ -279,7 +283,7 @@ base model.
 
 `<checkpoint>/torchturbo/checkpoint.json` records the source model path, the
 training model config, structural engine settings (backend, mixed precision,
-EP size, MTP, and freeze policy), and the PEFT adapter configs. When resuming
+parallel degrees, MTP, and freeze policy), and the PEFT adapter configs. When resuming
 from DCP state, the current PEFT config must match the saved one, so adapter
 structure and LoRA scaling (`lora_alpha`, `use_rslora`, `alpha_pattern`) stay
 the same. Only dropout, `bias`, initialization settings, and bookkeeping fields
@@ -300,8 +304,9 @@ torchrun --nproc_per_node=8 scripts/checkpoint/dcp_to_hf.py \
 
 The exported model is saved in `exports/my_run/step-1000/huggingface/`. The source
 model must remain accessible; if it has moved, pass its new path with
-`--model_name_or_path`. Export uses the saved expert parallelism (EP) size and MTP
-settings. The total number of processes must be a multiple of the EP size.
+`--model_name_or_path`. Export uses the saved parallelism and MTP settings.
+TP/ETP checkpoints require the saved world size; otherwise, the number of
+processes must be a multiple of the saved EP size.
 
 Use a separate export directory to avoid affecting automatic cleanup of training
 checkpoints. The script rejects identical input and output directories, paths
@@ -331,8 +336,10 @@ docs/runs/
 | `TORCH_TURBO_AC_USE_REENTRANT=true` | Use reentrant activation checkpointing to reduce cross-step memory peaks for MoE and linear attention |
 | `TORCH_TURBO_USE_DETERMINISTIC_ALGORITHMS=true` | Require the selected device runtime to use deterministic algorithms |
 | `TORCH_TURBO_SP_SIZE=2` | Set the sequence-parallel size |
+| `TORCH_TURBO_TP_SIZE=2` | Set the tensor-parallel size |
 | `TORCH_TURBO_EP_SIZE=8` | Set the expert-parallel size |
-| `TORCH_TURBO_GBS=64` | Set the global batch size in micro-batch units; the engine derives gradient accumulation from GBS, SP size, and world size |
+| `TORCH_TURBO_ETP_SIZE=2` | Set the expert tensor-parallel size |
+| `TORCH_TURBO_GBS=64` | Set the global batch size in micro-batch units; the engine derives gradient accumulation from GBS, SP/TP sizes, and world size |
 | `TORCH_TURBO_RESHARD_AFTER_FWD=0` | Control whether parameters are resharded after the forward pass |
 | `TORCH_TURBO_PREFETCH_STRATEGY=auto` | Set the FSDP prefetch topology: `native`, `auto` (default), `expert_lookahead`, or `expert_with_layer` |
 | `TORCH_TURBO_PREFETCH_DIRECTION=forward_backward` | Set the passes in which prefetching is applied: `forward` or `forward_backward` (default) |
@@ -347,7 +354,7 @@ Most environment variables have corresponding higher-priority `--tt_*` CLI argum
 | Category | Arguments |
 | --- | --- |
 | Basic configuration | `--tt_config` / `--tt_backend` / `--tt_mixed_precision` / `--tt_op_policy` / `--tt_use_deterministic_algorithms` |
-| Parallelism | `--tt_sp_size` / `--tt_ep_size` |
+| Parallelism | `--tt_sp_size` / `--tt_tp_size` / `--tt_ep_size` / `--tt_etp_size` |
 | Batch size | `--tt_gbs` |
 | Memory | `--tt_gradient_checkpointing` / `--tt_ac_use_reentrant` / `--tt_cpu_offload` |
 | Prefetching | `--tt_prefetch_strategy` / `--tt_prefetch_direction` / `--tt_forward_prefetch_depth` / `--tt_backward_prefetch_depth` |

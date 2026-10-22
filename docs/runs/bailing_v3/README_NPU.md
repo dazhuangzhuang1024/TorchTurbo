@@ -186,7 +186,7 @@ All training scripts share the same set of basic variables, although their defau
 | `SEQ_LEN` | `4096`, `65536`, or `8192` | Training sequence length, adjusted according to memory and data length |
 | `FINETUNING_TYPE` | `full` | Finetuning type; only supports `full` and `lora` |
 | `DATASET` | `science`, `orca_rlhf`, or a local path | LLaMA-Factory dataset ID registered in `dataset_info.json`, or an ms-swift dataset/local path |
-| `TT_CONFIG` | `${SCRIPT_DIR}/sft.yaml`, `${SCRIPT_DIR}/dpo.yaml`, or `${SCRIPT_DIR}/pt.yaml` | Sibling torchturbo engine config file shared by both frameworks for that stage |
+| `TT_CONFIG` | `${SCRIPT_DIR}/sft.yaml`, `${SCRIPT_DIR}/dpo.yaml`, or `${SCRIPT_DIR}/pt.yaml` | Sibling torchturbo engine config file shared by both frameworks for that stage, containing `engine_config.parallel_plan` (sp_size/tp_size/ep_size/etp_size) |
 
 Stage-specific defaults are:
 
