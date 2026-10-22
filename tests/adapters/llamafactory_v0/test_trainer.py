@@ -96,7 +96,7 @@ def test_pretraining_wraps_native_language_modeling_collation(padding_side):
             self.train_dataset = None
             self.data_collator = data_collator
 
-    trainer_cls = make_torchturbo_trainer(BaseTrainer, engine=object(), stage="pt")
+    trainer_cls = make_torchturbo_trainer(BaseTrainer, engine=SimpleNamespace(get_tp_info=lambda: {"tp_size": 1}), stage="pt")
     trainer = trainer_cls(data_collator=native_collator)
     assert isinstance(trainer.data_collator, LlamaFactoryInputCollator)
     result = trainer.data_collator([

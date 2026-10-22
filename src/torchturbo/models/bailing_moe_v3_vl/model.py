@@ -133,9 +133,9 @@ class TurboBailingMoeV3VLForConditionalGeneration(
         sp_rank = sp_info["sp_rank"]
         text_config = self.config.text_config
         patch_rms_norm(BailingMoeV3RMSNorm)
-        patch_kda_forward(
-            BailingMoeV3KimiDeltaAttention, sp_group, sp_size, sp_rank
-        )
+        for layer in self.model.layers:
+            if isinstance(layer.attention, BailingMoeV3KimiDeltaAttention):
+                patch_kda_forward(layer.attention, sp_group, sp_size, sp_rank)
         # The shared interface records QK-clip observations at any SP size;
         # the vision tower keeps its own subconfig attention implementation.
         self.register_sp_attention_interface(sp_info)

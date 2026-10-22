@@ -20,7 +20,30 @@ from torchturbo.parallel import (
     VisionBalanceMode,
     VisionBalanceSpec,
 )
-from torchturbo.engine.utils import match_fqn
+from torchturbo.utils.fqn import match_fqn
+
+
+def test_tensor_parallel_default_plan_is_isolated_between_instances():
+    from torch.distributed.tensor.parallel import ColwiseParallel
+
+    first = FSDPParallelPlan()
+    second = FSDPParallelPlan()
+    first.tensor_parallel_plan.plan["projection"] = ColwiseParallel()
+
+    assert second.tensor_parallel_plan.plan == {}
+    assert second.tensor_parallel_plan.validator is None
+
+
+def test_tensor_parallel_spec_default_mapping_is_isolated_between_instances():
+    from torch.distributed.tensor.parallel import ColwiseParallel
+    from torchturbo.parallel import TensorParallelPlanSpec
+
+    first = TensorParallelPlanSpec()
+    second = TensorParallelPlanSpec()
+    first.plan["projection"] = ColwiseParallel()
+
+    assert second.plan == {}
+    assert second.validator is None
 
 
 def test_standalone_world_shard_spec_is_valid():

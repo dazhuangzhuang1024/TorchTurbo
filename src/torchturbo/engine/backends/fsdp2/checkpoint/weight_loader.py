@@ -3,11 +3,13 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from safetensors.torch import load_file
 from torch.distributed._tensor import distribute_tensor, DTensor
+from torch.distributed.device_mesh import DeviceMesh
 
 from torchturbo.engine.peft.weights import (
     compute_dora_magnitude,
@@ -22,6 +24,11 @@ from torchturbo.engine.utils import (
 from torchturbo.logging import get_logger
 from torchturbo.engine.checkpoint.distributed import collective_check
 
+if TYPE_CHECKING:
+    from torchturbo.models.weight_converter import BaseWeightConverter
+    from torchturbo.engine.backends.fsdp2.parallel_context import ParallelContext
+    from torchturbo.runtime import DeviceRuntime
+
 logger = get_logger(__name__)
 
 
@@ -33,7 +40,7 @@ class _PendingTask:
     tensor is distributed into the model state dict.
     """
     __slots__ = (
-        'handle', 'full_tensor', 'param', 'mesh', 'key', 'target_dtype',
+        'handle', 'full_tensor', 'param', 'key', 'target_dtype',
         'group', 'source',
     )
 
@@ -42,7 +49,6 @@ class _PendingTask:
         handle,
         full_tensor,
         param,
-        mesh,
         key,
         target_dtype,
         group,
@@ -51,7 +57,6 @@ class _PendingTask:
         self.handle = handle
         self.full_tensor = full_tensor
         self.param = param
-        self.mesh = mesh
         self.key = key
         self.target_dtype = target_dtype
         self.group = group
@@ -68,15 +73,15 @@ class DistParamLoader:
 
     def __init__(
         self,
-        model,
-        path,
-        rank,
-        mesh,
-        world_mesh,
-        device_runtime,
-        is_cpu_offload,
-        weight_converter,
-    ):
+        model: torch.nn.Module,
+        path: str | Path,
+        rank: int,
+        mesh: DeviceMesh,
+        device_runtime: "DeviceRuntime",
+        is_cpu_offload: bool,
+        weight_converter: "BaseWeightConverter",
+        parallel_context: "ParallelContext | None" = None,
+    ) -> None:
         if weight_converter is None:
             raise ValueError("weight_converter must not be None")
         self.model = model
@@ -86,7 +91,6 @@ class DistParamLoader:
         self.device = device_runtime.device
         self.path = Path(path)
         self.mesh = mesh
-        self.world_mesh = world_mesh
         self.rank = rank
         self.world_size = dist.get_world_size()
 
@@ -95,11 +99,13 @@ class DistParamLoader:
         self.ep_rank = dist.get_rank(group=self.ep_group)
         self.ep_world_size = dist.get_world_size(group=self.ep_group)
 
-        # EDP topology (mirrors weight_saver)
-        self.edp_group = mesh["edp"].get_group()
-        self.edp_rank = mesh["edp"].get_local_rank()
-        current_ep_idx = mesh.get_local_rank("ep")
-        self.edp_ranks = mesh.mesh[:, current_ep_idx].tolist()
+        # Expert checkpoint owners (mirrors weight_saver).
+        if parallel_context is None:
+            self.expert_owner_group = mesh["edp"].get_group()
+            self.expert_owner_ranks = dist.get_process_group_ranks(self.expert_owner_group)
+        else:
+            self.expert_owner_group = parallel_context.expert_checkpoint_owner_group
+            self.expert_owner_ranks = parallel_context.expert_checkpoint_owner_ranks
 
         self.param_converter = weight_converter
         self.moe_config = self.param_converter.moe_config
@@ -207,7 +213,7 @@ class DistParamLoader:
                     common_params.append(hf_buffer_name)
                     self.param_size_map[hf_buffer_name] = buf.numel() * buf.element_size()
 
-        self._assign_param_to_ranks(expert_param_groups, self.edp_ranks, common_params)
+        self._assign_param_to_ranks(expert_param_groups, self.expert_owner_ranks, common_params)
 
         elapsed = time.perf_counter() - start_time
         num_files = len(set(
@@ -222,14 +228,14 @@ class DistParamLoader:
 
         return set(self.rank_to_params[self.rank])
 
-    def _assign_param_to_ranks(self, expert_param_groups, edp_ranks, common_params):
+    def _assign_param_to_ranks(self, expert_param_groups, expert_owner_ranks, common_params):
         """Two-phase param-to-rank assignment.
 
-        Phase 1: Expert params → EDP ranks, shard-size balanced round-robin.
-        Phase 2: Common params → all world ranks, file-grouped least-loaded.
+        Phase 1: Expert params -> owner ranks, shard-size balanced round-robin.
+        Phase 2: Common params -> all world ranks, file-grouped least-loaded.
         """
-        # ── Phase 1: Expert params → EDP ranks ──
-        num_edp_ranks = len(edp_ranks)
+        # Phase 1: Expert params -> owner ranks.
+        num_owner_ranks = len(expert_owner_ranks)
         accumulated_bytes = 0
         shard_params = []
         i = 0
@@ -238,7 +244,7 @@ class DistParamLoader:
             # Flush current shard before adding this group if it would cross the boundary.
             # This prevents splitting a model param's HF names across ranks.
             if accumulated_bytes > 0 and accumulated_bytes + group_bytes >= self.WEIGHT_SHARD_SIZE:
-                dst_rank = edp_ranks[i % num_edp_ranks]
+                dst_rank = expert_owner_ranks[i % num_owner_ranks]
                 # Commit this shard
                 shard_bytes = 0
                 for p in shard_params:
@@ -256,7 +262,7 @@ class DistParamLoader:
 
         # Flush remaining
         if shard_params:
-            dst_rank = edp_ranks[i % num_edp_ranks]
+            dst_rank = expert_owner_ranks[i % num_owner_ranks]
             shard_bytes = 0
             for p in shard_params:
                 self.param_to_rank[p] = dst_rank
@@ -360,7 +366,7 @@ class DistParamLoader:
     # ── Async Broadcast Helpers ────────────────────────────────────
 
     def _prepare_tensor(self, name, shape=None, broadcast_dtype=None, group=None):
-        """Prepare a broadcast tensor and return (tensor, mesh, group, source).
+        """Prepare a broadcast tensor and return (tensor, group, source).
 
         Broadcasts in broadcast_dtype (defaults to checkpoint dtype). Owner
         keeps the loaded dtype without conversion; non-owners allocate in
@@ -373,7 +379,7 @@ class DistParamLoader:
             tensor = self.local_sd[name].to(self.device)
         else:
             tensor = torch.empty(shape, device=self.device, dtype=broadcast_dtype)
-        return tensor, self.world_mesh, group, owner
+        return tensor, group, owner
 
     def _prepare_expert_weight(self, name, param):
         """Prepare expert weight1 or weight2 for an EDP-group broadcast.
@@ -389,17 +395,20 @@ class DistParamLoader:
 
         # Pre-allocate in checkpoint dtype
         tensor = torch.empty(param.shape, device=self.device, dtype=hf_dtype)
-        if self.rank == owner:
-            self.param_converter.assemble_expert_weight_for_broadcast(
-                tensor, self.local_sd, name
-            )
+        def assemble():
+            if self.rank == owner:
+                self.param_converter.assemble_expert_weight_for_broadcast(
+                    tensor, self.local_sd, name
+                )
 
-        return tensor, self.mesh["edp"], self.edp_group, owner
+        collective_check(assemble)
+
+        return tensor, self.expert_owner_group, owner
 
     def _prepare_lora(self, clean_name, param):
         """Prepare a LoRA adapter tensor for broadcast.
 
-        Returns (tensor, mesh, group, source).
+        Returns (tensor, group, source).
         """
         is_a = (".lora_A." in clean_name
                 or ".lora_A2." in clean_name
@@ -424,7 +433,7 @@ class DistParamLoader:
             else:
                 full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
 
-            return full, edp_mesh, edp_group, edp_src_global
+            return full, edp_group, edp_src_global
         else:
             if self.rank == 0:
                 full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
@@ -432,7 +441,7 @@ class DistParamLoader:
             else:
                 full = torch.empty(param.shape, device=self.device, dtype=param.dtype)
 
-            return full, self.world_mesh, None, 0
+            return full, None, 0
 
     # ── Memory Budget Sync ─────────────────────────────────────────
 
@@ -503,7 +512,7 @@ class DistParamLoader:
 
             if isinstance(task.param, DTensor):
                 sharded = distribute_tensor(
-                    task.full_tensor, task.mesh, task.param.placements, src_data_rank=None
+                    task.full_tensor, task.param.device_mesh, task.param.placements, src_data_rank=None
                 )
                 # Materialise a standalone local shard so the full broadcast
                 # buffer can be freed this iteration (the view into it is gone).
@@ -518,7 +527,7 @@ class DistParamLoader:
                 # shape/stride explicitly.
                 sharded_sd[task.key] = DTensor.from_local(
                     local,
-                    task.mesh,
+                    task.param.device_mesh,
                     task.param.placements,
                     run_check=False,
                     shape=task.param.shape,
@@ -602,9 +611,9 @@ class DistParamLoader:
                 processed += 1
                 continue
             if is_peft_adapter_param(clean_name):
-                full, mesh, group, source = self._prepare_lora(clean_name, param)
+                full, group, source = self._prepare_lora(clean_name, param)
             elif self.param_converter.is_expert_weight(clean_name):
-                full, mesh, group, source = self._prepare_expert_weight(clean_name, param)
+                full, group, source = self._prepare_expert_weight(clean_name, param)
             else:
                 hf_name = self.param_converter.to_hf_name(clean_name)
                 if hf_name not in self.param_to_filename:
@@ -621,7 +630,7 @@ class DistParamLoader:
                     continue
                 # Broadcast in checkpoint dtype; dtype conversion deferred to flush
                 hf_dtype = self.param_converter.get_default_hf_dtype(hf_name)
-                full, mesh, group, source = self._prepare_tensor(
+                full, group, source = self._prepare_tensor(
                     hf_name, param.shape, hf_dtype, group=None
                 )
 
@@ -638,7 +647,7 @@ class DistParamLoader:
 
             pending.append(
                 _PendingTask(
-                    None, full, param, mesh, name, target_dtype, group, source
+                    None, full, param, name, target_dtype, group, source
                 )
             )
             pending_bytes += tensor_bytes

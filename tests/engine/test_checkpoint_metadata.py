@@ -192,7 +192,7 @@ def test_checkpoint_without_metadata_is_legacy(tmp_path):
 
 @pytest.mark.parametrize(
     "content",
-    [None, '{"schema_version": 1', '{"schema_version": 2}'],
+    [None, '{"schema_version": 1', '{"schema_version": 99}'],
     ids=["missing", "corrupt", "unsupported_schema"],
 )
 def test_invalid_metadata_file_is_rejected(tmp_path, content):
@@ -203,3 +203,12 @@ def test_invalid_metadata_file_is_rejected(tmp_path, content):
 
     with pytest.raises(RuntimeError, match="Invalid checkpoint metadata"):
         load_metadata(str(tmp_path))
+
+
+def test_legacy_metadata_keeps_exact_schema1_field_structure():
+    config = EngineConfig.from_dict({"sp_size": 2, "ep_size": 3})
+    metadata = build_metadata(LinearModel(), config, "/models/base")
+    assert set(metadata) == {"schema_version", "source_path", "model_config", "engine_config", "peft_configs"}
+    assert metadata["schema_version"] == 1
+    assert set(metadata["engine_config"]) == {"backend", "mixed_precision", "parallel_plan", "mtp", "freeze_policy"}
+    assert metadata["engine_config"]["parallel_plan"] == {"ep_size": 3}

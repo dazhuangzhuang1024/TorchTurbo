@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 from pathlib import Path
@@ -391,7 +392,7 @@ def test_export_restores_structural_settings_and_rejects_ep_override():
     from torchturbo.engine import ParameterGroup, TorchTurboArgs
     from torchturbo.engine.args import parse_torchturbo_args
 
-    metadata = {"engine_config": {
+    metadata = {"schema_version": 1, "engine_config": {
         "backend": "fsdp2", "mixed_precision": "fp32",
         "parallel_plan": {"ep_size": 2},
         "mtp": {"enabled": True, "loss_scaling_factor": 0.3, "log_loss": True},
@@ -415,3 +416,251 @@ def test_export_restores_structural_settings_and_rejects_ep_override():
     args, _ = parse_torchturbo_args(["--tt_ep_size", "1"])
     with pytest.raises(ValueError, match="EP size must match"):
         dcp_to_hf.build_export_config(args, metadata)
+
+
+def _tp_metadata(config=None):
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.engine.checkpoint.metadata import build_metadata
+    from torch import nn
+    from transformers import PretrainedConfig
+    model = nn.Linear(2, 2)
+    model.config = PretrainedConfig()
+    layout = {
+        "layout_schema_version": 1, "expert_layout_version": "packed_2d_v1",
+        "topology": {"world_size": 8, "sp_size": 2, "tp_size": 2, "ep_size": 1, "etp_size": 1},
+        "parameters": [],
+    }
+    if config is None:
+        config = EngineConfig.from_dict({})
+    return build_metadata(model, config, "/source", parallel_layout=layout)
+
+
+def test_tp_export_restores_every_saved_degree():
+    from torchturbo.engine import TorchTurboArgs
+    config = dcp_to_hf.build_export_config(TorchTurboArgs(), _tp_metadata())
+    assert (config.parallel_plan.sp_size, config.parallel_plan.tp_size,
+            config.parallel_plan.ep_size, config.parallel_plan.etp_size) == (2, 2, 1, 1)
+
+
+@pytest.mark.parametrize("degree", ["sp", "tp", "ep", "etp"])
+def test_tp_export_rejects_explicit_degree_overrides(degree):
+    args, _ = args_module.parse_torchturbo_args([f"--tt_{degree}_size", "4"])
+    with pytest.raises(ValueError, match="size must match"):
+        dcp_to_hf.build_export_config(args, _tp_metadata())
+
+
+def test_tp_export_rejects_environment_degree_override(monkeypatch):
+    from torchturbo.engine import TorchTurboArgs
+    monkeypatch.setenv("TORCH_TURBO_TP_SIZE", "4")
+    with pytest.raises(ValueError, match="TP size must match"):
+        dcp_to_hf.build_export_config(TorchTurboArgs(), _tp_metadata())
+
+
+def test_tp_export_rejects_wrong_world_before_engine_construction(monkeypatch):
+    import torch.distributed as dist
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: _tp_metadata())
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 4)
+    monkeypatch.setattr(engine_module, "TorchTurboEngine", lambda _: pytest.fail("engine constructed before WORLD validation"))
+    with pytest.raises(ValueError, match="WORLD"):
+        dcp_to_hf.main(_REQUIRED)
+
+
+def test_tp_export_requires_custom_python_plan_from_caller(monkeypatch):
+    import torch.distributed as dist
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    metadata = _tp_metadata()
+    metadata["engine_config"]["custom_tensor_parallel_plan"] = True
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: metadata)
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(engine_module, "TorchTurboEngine", lambda _: pytest.fail("custom plan was guessed"))
+    with pytest.raises(ValueError, match="Python TP plan"):
+        dcp_to_hf.main(_REQUIRED)
+
+
+def test_tp_export_requires_validator_only_python_override_from_caller(monkeypatch):
+    import torch.distributed as dist
+    from torch import nn
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.parallel import (
+        FSDPParallelPlan,
+        TensorParallelPlanSpec,
+        TensorParallelValidator,
+    )
+
+    class ModelValidator(TensorParallelValidator):
+        def validate(self, model: nn.Module, parallel_plan: FSDPParallelPlan) -> None:
+            if parallel_plan.sp_size != 1:
+                raise ValueError("This model validator requires sp_size=1.")
+
+    config = EngineConfig(parallel_plan=FSDPParallelPlan(
+        tensor_parallel_plan=TensorParallelPlanSpec(validator=ModelValidator()),
+    ))
+    metadata = _tp_metadata(config)
+    assert metadata["engine_config"]["custom_tensor_parallel_plan"] is True
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: metadata)
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(engine_module, "TorchTurboEngine", lambda _: pytest.fail("validator override was guessed"))
+    with pytest.raises(ValueError, match="Python TP plan"):
+        dcp_to_hf.main(_REQUIRED)
+
+
+@pytest.mark.parametrize("field,value", [("layout_schema_version", 99), ("expert_layout_version", "unknown_logical_v99")])
+def test_tp_export_rejects_unimplemented_layout_before_source_loading(monkeypatch, field, value):
+    import torch.distributed as dist
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    metadata = _tp_metadata()
+    metadata["parallel_layout"][field] = value
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: metadata)
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    with pytest.raises(ValueError, match="layout"):
+        dcp_to_hf.main(_REQUIRED)
+
+
+@pytest.mark.parametrize("field", ["ep_size", "etp_size"])
+def test_packed_tp_export_rejects_expert_parallelism_before_source(monkeypatch, field):
+    import torch.distributed as dist
+    from transformers import AutoConfig
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    metadata = _tp_metadata()
+    metadata["parallel_layout"]["topology"][field] = 2
+    metadata["engine_config"]["parallel_plan"][field] = 2
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: metadata)
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *a, **k: pytest.fail("source loaded before topology validation"))
+    monkeypatch.setattr(engine_module, "TorchTurboEngine", lambda _: pytest.fail("engine constructed before topology validation"))
+    with pytest.raises(ValueError, match="topology|aligned"):
+        dcp_to_hf.main(_REQUIRED)
+
+
+def test_packed_export_rejects_etp_without_tp_before_source(tmp_path, monkeypatch):
+    import torch.distributed as dist
+    from transformers import AutoConfig
+    from torchturbo.engine.checkpoint.metadata import load_metadata, save_metadata
+
+    metadata = _tp_metadata()
+    for field, value in (("tp_size", 1), ("etp_size", 2)):
+        metadata["parallel_layout"]["topology"][field] = value
+        metadata["engine_config"]["parallel_plan"][field] = value
+    checkpoint = tmp_path / "checkpoint"
+    save_metadata(metadata, str(checkpoint))
+    assert load_metadata(str(checkpoint)) == metadata
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *a, **k: pytest.fail("source loaded before topology validation"))
+    with pytest.raises(ValueError, match="topology.*ETP=1 when TP=1"):
+        dcp_to_hf.main([
+            "--checkpoint_dir", str(checkpoint),
+            "--output_dir", str(tmp_path / "export"),
+        ])
+
+
+@pytest.mark.parametrize("tp_size,ep_size", [(2, 1), (1, 2)])
+def test_packed_export_accepts_supported_topology(monkeypatch, tp_size, ep_size):
+    import torch.distributed as dist
+    from transformers import AutoConfig, PretrainedConfig
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    metadata = _tp_metadata()
+    for field, value in (("tp_size", tp_size), ("ep_size", ep_size)):
+        metadata["parallel_layout"]["topology"][field] = value
+        metadata["engine_config"]["parallel_plan"][field] = value
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: metadata)
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *a, **k: PretrainedConfig())
+    completed = []
+
+    class ExportEngine:
+        def __init__(self, config):
+            assert config.parallel_plan.tp_size == tp_size
+            assert config.parallel_plan.ep_size == ep_size
+            assert config.parallel_plan.etp_size == 1
+        def prepare_model(self, **kwargs):
+            return object()
+        def load_from_checkpoint(self, model, directory):
+            completed.append("loaded")
+        def save_model(self, model, directory, **kwargs):
+            completed.append("exported")
+
+    monkeypatch.setattr(engine_module, "TorchTurboEngine", ExportEngine)
+    dcp_to_hf.main(_REQUIRED)
+    assert completed == ["loaded", "exported"]
+
+
+def _logical_metadata():
+    metadata = _tp_metadata()
+    metadata["parallel_layout"]["expert_layout_version"] = "gated_logical_v1"
+    for field in ("ep_size", "etp_size"):
+        metadata["parallel_layout"]["topology"][field] = 2
+        metadata["engine_config"]["parallel_plan"][field] = 2
+    return metadata
+
+
+def test_logical_export_reconstructs_authored_plan_settings(monkeypatch):
+    import torch.distributed as dist
+    from transformers import AutoConfig, PretrainedConfig
+    from torchturbo.models.qwen3_moe.model import TurboQwen3MoeForCausalLM
+    from torchturbo.engine.tensor_parallel.expert import GroupedMLPParallel
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    metadata = _logical_metadata()
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: metadata)
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *a, **k: PretrainedConfig())
+    captured = []
+    class ExportEngine:
+        def __init__(self, config):
+            captured.append(config)
+        def prepare_model(self, **kwargs):
+            return object()
+        def load_from_checkpoint(self, model, directory):
+            captured.append("loaded")
+        def save_model(self, model, directory, **kwargs):
+            captured.append("exported")
+    monkeypatch.setattr(engine_module, "TorchTurboEngine", ExportEngine)
+    dcp_to_hf.main(_REQUIRED)
+    config = captured[0]
+    assert (config.parallel_plan.sp_size, config.parallel_plan.tp_size,
+            config.parallel_plan.ep_size, config.parallel_plan.etp_size) == (2, 2, 2, 2)
+    assert captured[1:] == ["loaded", "exported"]
+    plan = TurboQwen3MoeForCausalLM.get_default_parallel_plan()
+    assert any(isinstance(style, GroupedMLPParallel) for style in plan.tensor_parallel_plan.plan.values())
+
+
+@pytest.mark.parametrize("field,value", [("tp_size", 4), ("etp_size", 1), ("sp_size", 3), ("ep_size", 3)])
+def test_logical_export_rejects_unsupported_topology_before_source(monkeypatch, field, value):
+    import torch.distributed as dist
+    from transformers import AutoConfig
+    import torchturbo.engine.checkpoint.metadata as metadata_module
+    metadata = _logical_metadata()
+    metadata["parallel_layout"]["topology"][field] = value
+    metadata["engine_config"]["parallel_plan"][field] = value
+    monkeypatch.setattr(metadata_module, "load_metadata", lambda _: metadata)
+    monkeypatch.setattr(engine_module, "init_process_group_if_needed", lambda **_: None)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *a, **k: pytest.fail("source loaded before topology validation"))
+    with pytest.raises(ValueError, match="topology|aligned"):
+        dcp_to_hf.main(_REQUIRED)
+
+
+@pytest.mark.parametrize("channel", ["cli", "environment", "config"])
+@pytest.mark.parametrize("degree", ["sp", "tp", "ep", "etp"])
+def test_logical_export_rejects_degree_override(tmp_path, monkeypatch, channel, degree):
+    from torchturbo.engine import TorchTurboArgs
+    args = TorchTurboArgs()
+    if channel == "cli":
+        args, _ = args_module.parse_torchturbo_args([f"--tt_{degree}_size", "4"])
+    elif channel == "environment":
+        monkeypatch.setenv(f"TORCH_TURBO_{degree.upper()}_SIZE", "4")
+    else:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"engine_config": {"parallel_plan": {f"{degree}_size": 4}}}))
+        args, _ = args_module.parse_torchturbo_args(["--tt_config", str(path)])
+    with pytest.raises(ValueError, match="size must match"):
+        dcp_to_hf.build_export_config(args, _logical_metadata())

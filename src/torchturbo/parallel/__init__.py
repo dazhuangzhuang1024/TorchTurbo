@@ -4,6 +4,8 @@ from .fsdp import (
     FSDPPlanSpec,
     FSDPParallelPlan,
     FSDPPlacementSpec,
+    TensorParallelPlanSpec,
+    TensorParallelValidator,
     VisionBalanceMode,
     VisionBalanceSpec,
 )
@@ -14,6 +16,8 @@ __all__ = [
     "FSDPPlanSpec",
     "FSDPParallelPlan",
     "FSDPPlacementSpec",
+    "TensorParallelPlanSpec",
+    "TensorParallelValidator",
     "VisionBalanceMode",
     "VisionBalanceSpec",
 ]

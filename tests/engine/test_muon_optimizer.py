@@ -3508,6 +3508,7 @@ def test_fsdp2_muon_pure_fallback_builds_fixed_adamw_only():
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = SimpleNamespace(device=torch.device("cpu"))
     backend.fsdp_config = SimpleNamespace(cpu_offload=CPUOffloadConfig())
     backend._sp_size = 1
@@ -3544,6 +3545,7 @@ def test_fsdp2_builds_optimizer_class_plan_and_preserves_parameters():
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = SimpleNamespace(device=torch.device("cpu"))
     backend.fsdp_config = SimpleNamespace(cpu_offload=CPUOffloadConfig())
     backend._mesh = {"edp": object()}
@@ -3589,6 +3591,7 @@ def test_fsdp2_optimizer_class_plan_swaps_in_adamw_swap_for_optimizer_offload(
 
     device_runtime = SimpleNamespace(device=torch.device("cpu"))
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = device_runtime
     backend.fsdp_config = SimpleNamespace(
         cpu_offload=CPUOffloadConfig(
@@ -3619,6 +3622,7 @@ def test_fsdp2_optimizer_class_plan_rejects_non_adamw_for_optimizer_offload():
     from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = SimpleNamespace(device=torch.device("cpu"))
     backend.fsdp_config = SimpleNamespace(
         cpu_offload=CPUOffloadConfig(enabled=True, mode=CPUOffloadMode.OPTIMIZER)
@@ -3641,6 +3645,7 @@ def test_fsdp2_muon_allows_sp_and_returns_final_optimizer(monkeypatch, bias):
     from torchturbo.engine.backends.fsdp2.optimizers import FSDPDistributedMuon
 
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = SimpleNamespace(device=torch.device("cuda"))
     backend.fsdp_config = SimpleNamespace(cpu_offload=CPUOffloadConfig())
     backend._sp_size = 8
@@ -3680,6 +3685,7 @@ def test_fsdp2_muon_requires_pytorch_2_10(monkeypatch):
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = SimpleNamespace(device=torch.device("cuda"))
     backend.fsdp_config = SimpleNamespace(cpu_offload=CPUOffloadConfig())
     backend._mesh = {"edp": object()}
@@ -3719,6 +3725,7 @@ def test_fsdp2_rejects_unsupported_optimizer_plan():
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
 
     class UnknownPlan(OptimizerPlan):
         def get_param_groups(self):

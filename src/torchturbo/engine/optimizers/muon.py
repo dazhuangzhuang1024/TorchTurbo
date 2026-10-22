@@ -17,7 +17,7 @@ from torch import nn
 
 from ...logging import get_logger
 from ..model_fqn import ModelFQNMap, build_model_fqn_map
-from ..utils import match_fqn
+from ...utils.fqn import match_fqn
 from .plan import (
     OptimizerPlan,
     OptimizerRecipe,

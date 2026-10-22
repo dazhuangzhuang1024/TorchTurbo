@@ -35,7 +35,7 @@ class MoETokenDispatcher:
         """
         self.config = config
 
-        # HACK: not support tp yet, always 1
+        # Aligned ETP dispatches independently on each EP lane without token TP.
         self.tp_size = 1
         self.ep_size = config.expert_model_parallel_size or 1
         self._ep_group = ep_group

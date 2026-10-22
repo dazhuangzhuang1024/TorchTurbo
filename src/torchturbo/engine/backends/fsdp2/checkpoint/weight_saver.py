@@ -3,7 +3,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import psutil
 import gc
 
@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 from torch.distributed._tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
 from transformers.utils import CONFIG_NAME
 
 from torchturbo.engine.peft.weights import apply_lora_delta, build_lora_delta_map
@@ -19,6 +20,11 @@ from torchturbo.logging import get_logger
 
 from ....checkpoint.layout import HF_INDEX_FILE, save_json, sync_directory
 from ....checkpoint.distributed import collective_check, rank_zero_call
+
+if TYPE_CHECKING:
+    from torchturbo.models.weight_converter import BaseWeightConverter
+    from torchturbo.engine.backends.fsdp2.parallel_context import ParallelContext
+    from torchturbo.runtime import DeviceRuntime
 
 logger = get_logger(__name__)
 
@@ -69,15 +75,16 @@ def _sync_mtp_layer_count(config_path: Path, runtime_config: dict[str, Any]) -> 
 class ShardedParamManager:
     def __init__(
         self,
-        model,
-        rank,
-        mesh,
-        weight_converter,
-        device_runtime,
-        path=None,
-        processing_class=None,
+        model: torch.nn.Module,
+        rank: int,
+        mesh: DeviceMesh,
+        weight_converter: "BaseWeightConverter",
+        device_runtime: "DeviceRuntime",
+        path: str | Path | None = None,
+        processing_class: Any | None = None,
         is_cpu_offload: bool = False,
-    ):
+        parallel_context: "ParallelContext | None" = None,
+    ) -> None:
         if weight_converter is None:
             raise ValueError("weight_converter must not be None")
         self.move_to_cpu = True
@@ -99,8 +106,11 @@ class ShardedParamManager:
             self.config = self.model.config
 
         self.world_size = dist.get_world_size()
-        current_ep_idx = self.mesh.get_local_rank("ep")
-        self.edp_ranks = self.mesh.mesh[:, current_ep_idx].tolist()
+        if parallel_context is None:
+            expert_owner_group = self.mesh["edp"].get_group()
+            self.expert_owner_ranks = dist.get_process_group_ranks(expert_owner_group)
+        else:
+            self.expert_owner_ranks = parallel_context.expert_checkpoint_owner_ranks
 
         self.processing_class = processing_class
         self.src_path = Path(path) if path else None
@@ -155,21 +165,21 @@ class ShardedParamManager:
                 lowest = self.rank_shard_bytes[rank]
         return result
 
-    def _assign_param_to_ranks(self, ep_params, edp_ranks, common_params):
+    def _assign_param_to_ranks(self, ep_params, expert_owner_ranks, common_params):
         i = 0
-        num_edp_ranks = len(edp_ranks)
+        num_owner_ranks = len(expert_owner_ranks)
         accumulated_bytes = 0
         shard_params = []
-        dst_rank = edp_ranks[0]
+        dst_rank = expert_owner_ranks[0]
         for param in ep_params:
             accumulated_bytes += self.param_size_map[param]
             shard_params.append(param)
             if accumulated_bytes >= self.WEIGHT_SHARD_SIZE:
-                dst_rank = edp_ranks[i % num_edp_ranks]
+                dst_rank = expert_owner_ranks[i % num_owner_ranks]
                 shard_params, accumulated_bytes = self._update_per_shard(shard_params, dst_rank)
                 i += 1
         if shard_params:
-            dst_rank = edp_ranks[i % num_edp_ranks]
+            dst_rank = expert_owner_ranks[i % num_owner_ranks]
             shard_params, accumulated_bytes = self._update_per_shard(shard_params, dst_rank)
         param_to_rank_list = [None] * self.ep_size
         dist.all_gather_object(param_to_rank_list, self.param_to_rank, group=self.ep_group)
@@ -228,7 +238,7 @@ class ShardedParamManager:
                 common_params.append(hf_buffer_name)
                 self.param_size_map[hf_buffer_name] = buf.numel() * buf.element_size()
 
-        self._assign_param_to_ranks(expert_params, self.edp_ranks, common_params)
+        self._assign_param_to_ranks(expert_params, self.expert_owner_ranks, common_params)
 
         elapsed = time.perf_counter() - start_time
         logger.info_rank0("[save] meta info built in %.2fs", elapsed)
@@ -314,6 +324,7 @@ class ShardedParamManager:
         )
         return staged.full_tensor()
 
+    @torch.no_grad()
     def _get_local_hf_state_dict(self, local_params):
         """Build state_dict containing only the parameters this rank needs to save."""
         start_time = time.perf_counter()
@@ -440,27 +451,30 @@ class ShardedParamManager:
                         self.rank, file_name, file_elapsed,
                     )
 
-            if self.rank == 0:
-                self._copy_non_safetensor_files(self.src_path, save_path)
-                if self.processing_class is not None:
-                    self.processing_class.save_pretrained(save_path)
-                # The export keeps the source config; other training-time
-                # changes such as use_cache are not written back.
-                _sync_mtp_layer_count(
-                    save_path / CONFIG_NAME, self.model.config.to_dict()
-                )
-                # Config/tokenizer files must be durable before publishing the
-                # index. Shard writers sync their own files above.
-                for directory, _, files in os.walk(save_path):
-                    for name in files:
-                        if name.endswith(".safetensors"):
-                            continue
-                        with open(os.path.join(directory, name), "rb") as file:
-                            os.fsync(file.fileno())
-                    sync_directory(directory)
             return weight_map
 
         weight_map = collective_check(write_files)
+
+        def finalize_metadata() -> None:
+            self._copy_non_safetensor_files(self.src_path, save_path)
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(save_path)
+            # The export keeps the source config; other training-time
+            # changes such as use_cache are not written back.
+            _sync_mtp_layer_count(
+                save_path / CONFIG_NAME, self.model.config.to_dict()
+            )
+            # All shard writers have completed, so the metadata scan cannot
+            # race with their temporary-file renames.
+            for directory, _, files in os.walk(save_path):
+                for name in files:
+                    if name.endswith(".safetensors"):
+                        continue
+                    with open(os.path.join(directory, name), "rb") as file:
+                        os.fsync(file.fileno())
+                sync_directory(directory)
+
+        rank_zero_call(finalize_metadata)
         # step 3, deal with non-tensor metas
         weight_map_list = [None] * self.world_size
         dist.all_gather_object(weight_map_list, weight_map)

@@ -54,6 +54,8 @@ except ImportError:
 from .configuration_bailing_moe_v3 import BailingMoeV3Config
 from transformers.generation.utils import GenerationMixin
 from transformers import modeling_flash_attention_utils as flash_utils
+
+from .attention import local_mla_rotary_key
 from dataclasses import dataclass
 from transformers.utils import ModelOutput
 from transformers.processing_utils import Unpack
@@ -721,6 +723,7 @@ class BailingMoeV3MultiLatentAttention(nn.Module):
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_rot = local_mla_rotary_key(self, k_rot)
 
         k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
         k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)

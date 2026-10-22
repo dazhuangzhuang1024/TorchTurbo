@@ -1,4 +1,38 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import torch
+import torch.distributed as dist
+
+
+_router_statistics_enabled: ContextVar[bool] = ContextVar(
+    "router_statistics_enabled", default=True
+)
+
+
+def router_statistics_enabled() -> bool:
+    """Return whether this forward should publish router bookkeeping."""
+    return _router_statistics_enabled.get()
+
+
+@contextmanager
+def suppress_router_statistics() -> Iterator[None]:
+    """Suppress replay side effects while preserving router tensor operations."""
+    token = _router_statistics_enabled.set(False)
+    try:
+        yield
+    finally:
+        _router_statistics_enabled.reset(token)
+
+
+def synchronize_routing_indices(
+    indices: torch.Tensor, routing_group: dist.ProcessGroup | None
+) -> torch.Tensor:
+    """Use lane zero's discrete selections without communicating probabilities."""
+    if routing_group is not None:
+        dist.broadcast(indices, src=dist.get_global_rank(routing_group, 0), group=routing_group)
+    return indices
 
 
 def mask_padding_tokens(
@@ -17,6 +51,7 @@ def compute_routing_scores_for_aux_loss(
     topk: int,
     score_function: str,
     padding_mask: torch.Tensor | None = None,
+    routing_group: dist.ProcessGroup | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the bias-free AUX routing map; True in padding_mask is excluded."""
     logits = logits.reshape(-1, logits.size(-1))
@@ -31,7 +66,9 @@ def compute_routing_scores_for_aux_loss(
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
-    top_indices = torch.topk(scores, k=topk, dim=-1).indices
+    top_indices = synchronize_routing_indices(
+        torch.topk(scores, k=topk, dim=-1).indices, routing_group
+    )
     routing_map = torch.zeros_like(logits, dtype=torch.int32).scatter_(
         1, top_indices, 1
     ).bool()

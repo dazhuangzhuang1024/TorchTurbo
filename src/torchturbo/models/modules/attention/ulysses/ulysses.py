@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import partial, wraps
 from types import MethodType
+from weakref import WeakKeyDictionary, ref
 from typing import Any, Optional, Tuple
 
 import torch
@@ -372,6 +373,26 @@ def ulysses_flash_attention_forward(
 
 TURBO_ULYSSES_ATTENTION = "turbo_ulysses"
 
+_module_attention_bindings: WeakKeyDictionary[torch.nn.Module, Callable] = WeakKeyDictionary()
+_config_attention_bindings: dict[int, tuple[Callable, Callable]] = {}
+
+
+def _registered_ulysses_attention(
+    module: torch.nn.Module, *args: Any, **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Dispatch the stable registry name through the caller's runtime binding."""
+    binding = None
+    if isinstance(module, torch.nn.Module):
+        binding = _module_attention_bindings.get(module)
+    if binding is None:
+        entry = _config_attention_bindings.get(id(module.config))
+        if entry is None:
+            raise RuntimeError("Ulysses attention module has no active runtime binding; register its owner or config.")
+        config_ref, binding = entry
+        if config_ref() is not module.config:
+            raise RuntimeError("Ulysses attention module has no active runtime binding; register its owner or config.")
+    return binding(module, *args, **kwargs)
+
 
 def ulysses_attention_forward(
     module: torch.nn.Module,
@@ -447,13 +468,16 @@ def register_turbo_ulysses_attention(
     attn_config: Any,
     sp_group: Optional[ProcessGroup],
     sp_size: int,
+    *,
+    attention_modules: tuple[torch.nn.Module, ...] | None = None,
 ) -> None:
     """Bind the ``turbo_ulysses`` attention interface to one SP group.
 
-    Registers the SP-bound interface in ``ALL_ATTENTION_FUNCTIONS`` and
-    switches ``attn_config._attn_implementation`` to it. Attention modules
-    resolve the interface from the registry at forward time, so the switch
-    takes effect on models that are already built. Subconfigs that keep
+    Registers a stateless interface in ``ALL_ATTENTION_FUNCTIONS`` and
+    switches ``attn_config._attn_implementation`` to it. Supplied attention
+    modules own independent SP bindings, even when models share one config.
+    Direct callers that omit modules retain config-scoped binding semantics.
+    Bindings stay outside HF config serialization. Subconfigs that keep
     their own implementation (e.g. VLM vision towers on ``flash_attention_2``)
     stay on the native flash path.
 
@@ -464,9 +488,22 @@ def register_turbo_ulysses_attention(
     from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION] = partial(
-        ulysses_attention_forward, sp_group=sp_group, sp_size=sp_size
-    )
+    binding = partial(ulysses_attention_forward, sp_group=sp_group, sp_size=sp_size)
+    if attention_modules is not None:
+        for module in attention_modules:
+            _module_attention_bindings[module] = binding
+    else:
+        config_id = id(attn_config)
+        try:
+            config_ref = ref(
+                attn_config, lambda _: _config_attention_bindings.pop(config_id, None)
+            )
+        except TypeError:
+            # Direct API callers can pass non-weakrefable configuration objects.
+            # Their process-scoped binding retains the configuration object.
+            config_ref = lambda: attn_config
+        _config_attention_bindings[config_id] = (config_ref, binding)
+    ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION] = _registered_ulysses_attention
     # HF checks the global mask registry before dispatching mask creation.
     ALL_MASK_ATTENTION_FUNCTIONS.register(
         TURBO_ULYSSES_ATTENTION,

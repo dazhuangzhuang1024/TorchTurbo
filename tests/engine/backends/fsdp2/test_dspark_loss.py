@@ -30,6 +30,7 @@ def _process_ops(monkeypatch):
 
 def _backend(dspark_scaling=_SCALING):
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_tp_info = lambda: {"tp_size": 1}
     backend.rank = 0
     backend.config = SimpleNamespace(
         loss_chunk=LossChunkConfig(enabled=False),
@@ -137,3 +138,23 @@ def test_dspark_loss_follows_num_items_across_gradient_accumulation():
         count * value for count, (_, value) in zip(token_counts, micro_batches)
     ) / num_items
     torch.testing.assert_close(total, lm_loss + _SCALING * dspark_mean)
+
+
+def test_tp_rejects_dynamic_dspark_output_before_loss_callable(monkeypatch):
+    model = _DSparkModel()
+    backend = _backend()
+    backend.get_tp_info = lambda: {"tp_size": 2}
+    inputs = _micro_batch([-100, 1, 2, 3, 4, 0])
+    model_inputs = {key: value for key, value in inputs.items() if key != "labels"}
+    outputs = model(**model_inputs, position_ids=None, use_cache=False)
+    calls = []
+    outputs.dspark_loss_fn = lambda labels: calls.append(labels)
+    monkeypatch.setattr(backend, "_forward_for_lm_loss", lambda *args, **kwargs: (outputs, None))
+
+    def compute_lm_loss(**kwargs):
+        pytest.fail("TP DSpark reached loss normalization")
+
+    monkeypatch.setattr(backend, "_compute_lm_loss_with_sp", compute_lm_loss)
+    with pytest.raises(ValueError, match="TP.*DSpark"):
+        backend.compute_loss(model, inputs, num_items_in_batch=5)
+    assert calls == []

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from ..engine.utils import match_fqn
+from torch import nn
+from torch.distributed.tensor.parallel import ParallelStyle
+
+from ..utils.fqn import match_fqn
 from .parallel import ParallelPlan
 
 if TYPE_CHECKING:
@@ -60,6 +64,9 @@ class FSDPPlacementSpec:
 class FSDPPlanSpec:
     """Unified logical settings for an FSDP module or its layers.
 
+    FSDP patterns select the first matching spec in insertion order. TP
+    styles use a separate map and reject overlapping matches.
+
     Attributes
     ----------
     placement:
@@ -67,7 +74,8 @@ class FSDPPlanSpec:
     no_shard:
         Whether to skip FSDP sharding for this module completely.
     standalone_world_shard:
-        Whether to shard this module as a standalone FSDP unit on the world mesh.
+        Whether to shard this module as a standalone FSDP unit on the world
+        mesh. With TP enabled, the unit uses its dense FSDP domain.
     activation_checkpoint:
         Whether to apply whole-module activation checkpointing to this module.
     replace_module:
@@ -107,6 +115,35 @@ class FSDPPlanSpec:
             )
 
 
+class TensorParallelValidator(ABC):
+    """Validate original and prepared modules without mutation.
+
+    The FSDP2 backend invokes the same validator before mesh creation/module
+    replacement and after replacement/target resolution, before TP application.
+    Implementations must support meta tensors and inspect live module metadata
+    and shapes without changing modules, parameters, hooks, config or groups.
+    The parallel plan contains the final merged SP/EP/TP/ETP degrees. Backend
+    feature and target admission remains mandatory with a custom validator.
+    """
+
+    @abstractmethod
+    def validate(self, model: nn.Module, parallel_plan: FSDPParallelPlan) -> None:
+        """Raise ValueError when the model does not support the plan."""
+
+
+@dataclass
+class TensorParallelPlanSpec:
+    """Declare native TP styles and an optional model contract validator.
+
+    Attributes:
+        plan: FQN patterns mapped to native ParallelStyle instances.
+        validator: Model validator applied to the resolved parallel plan.
+    """
+
+    plan: dict[str, ParallelStyle] = field(default_factory=dict)
+    validator: TensorParallelValidator | None = None
+
+
 @dataclass
 class FSDPParallelPlan(ParallelPlan):
     """FSDP-specific parallel plan spanning topologies and placements.
@@ -121,6 +158,13 @@ class FSDPParallelPlan(ParallelPlan):
         Expert Parallelism group size.
     tp_size:
         Tensor Parallelism group size.
+    etp_size:
+        Expert Tensor Parallelism group size, configured separately from tp_size
+        and defaulting to 1. FSDP2 requires etp_size=1 for dense TP or aligned
+        tp_size=etp_size>1 for routed TP.
+    tensor_parallel_plan:
+        Native TP styles and optional model contract validator. Every target
+        must match exactly one style in the spec's plan.
     """
 
     plan: dict[str, FSDPPlacementSpec | FSDPPlanSpec | Any] = field(
@@ -129,6 +173,10 @@ class FSDPParallelPlan(ParallelPlan):
     sp_size: int = 1
     ep_size: int = 1
     tp_size: int = 1
+    etp_size: int = 1
+    tensor_parallel_plan: TensorParallelPlanSpec = field(
+        default_factory=TensorParallelPlanSpec
+    )
 
     def __post_init__(self) -> None:
         """Normalize plan values to FSDPPlanSpec/FSDPPlacementSpec."""

@@ -356,7 +356,10 @@ class TestEngineSetup:
                 assert context is parallel_context
                 assert flash_integration._flash_attention_forward is attention_forward
                 self.register_sp_attention_interface(context["sp"])
-                sp_binding.append(ALL_ATTENTION_FUNCTIONS.get(TURBO_ULYSSES_ATTENTION))
+                from torchturbo.models.modules.attention.ulysses.ulysses import (
+                    _module_attention_bindings,
+                )
+                sp_binding.append(_module_attention_bindings[self])
                 # The registry path must leave the shared FA helper alone.
                 assert flash_integration._flash_attention_forward is attention_forward
 
@@ -364,7 +367,10 @@ class TestEngineSetup:
                 order.append("on_materialized")
                 assert self.projection.weight.device.type == "cpu"
                 assert flash_integration._flash_attention_forward is attention_forward
-                assert ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION] is sp_binding[0]
+                from torchturbo.models.modules.attention.ulysses.ulysses import (
+                    _module_attention_bindings,
+                )
+                assert _module_attention_bindings[self] is sp_binding[0]
 
             def get_weight_converter(self, context, model_path):
                 order.append("weight_converter")
@@ -884,6 +890,7 @@ class TestEngineSetup:
         engine = object.__new__(TorchTurboEngine)
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
+        engine.get_tp_info = lambda: {"tp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
 
         mb_item = {
@@ -907,11 +914,13 @@ class TestEngineSetup:
         assert calls[0][0] == (2, 1)
         assert engine.model.weight.grad is not None
         assert torch.isfinite(engine.model.weight.grad)
+        assert engine.model.weight.grad.item() == pytest.approx(2.5)
 
     def test_forward_backward_batch_forward_only_skips_backward(self):
         engine = object.__new__(TorchTurboEngine)
         engine.model = TinyLogitsModel()
         engine.get_sp_info = lambda: {"sp_size": 1}
+        engine.get_tp_info = lambda: {"tp_size": 1}
         engine.get_dp_info = lambda: {"dp_size": 1, "dp_group": None}
 
         mb_item = {
@@ -1085,7 +1094,7 @@ class TestEngineSetup:
 # ---------------------------------------------------------------------------
 
 
-def _make_engine_for_ga(sp_size, world_size, gbs=None):
+def _make_engine_for_ga(sp_size, world_size, gbs=None, tp_size=1):
     """Build a bare TorchTurboEngine with mocked sp/dp info + config.gbs.
 
     Patches the engine module's ``dist`` reference so
@@ -1094,6 +1103,8 @@ def _make_engine_for_ga(sp_size, world_size, gbs=None):
     """
     engine = object.__new__(TorchTurboEngine)
     engine.get_sp_info = lambda: {"sp_size": sp_size}
+    engine.get_dp_info = lambda: {"dp_size": world_size // (sp_size * tp_size)}
+    engine.get_tp_info = lambda: {"tp_size": tp_size}
     engine.config = SimpleNamespace(
         gbs=gbs,
         mfu=SimpleNamespace(enabled=False),
@@ -1294,3 +1305,135 @@ def test_checkpoint_loads_and_optimizer_state_delegate_to_the_backend(dummy_engi
         ("save_optimizer_and_scheduler", optimizer, scheduler, "/out/checkpoint-1"),
         ("load_optimizer_and_scheduler", optimizer, scheduler, "/out/checkpoint-1"),
     ]
+
+
+@pytest.mark.parametrize("provenance", ["model_default", "caller_override", "no_caller_plan"])
+def test_prepare_model_preserves_tp_plan_provenance_for_metadata_and_next_model(dummy_engine, monkeypatch, provenance):
+    import json
+    from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+    from transformers import PretrainedConfig, PreTrainedModel
+    from torchturbo.engine.checkpoint.metadata import build_metadata
+    from torchturbo.parallel import TensorParallelPlanSpec, FSDPParallelPlan
+
+    class DefaultPlanModel(TurboModel, PreTrainedModel):
+        config_class = PretrainedConfig
+
+        def __init__(self, config):
+            config._attn_implementation = "eager"
+            super().__init__(config)
+            self.default_projection = nn.Linear(4, 4, bias=False)
+
+        def get_weight_converter(self, parallel_context, model_path):
+            return object()
+
+        @classmethod
+        def get_default_parallel_plan(cls, **kwargs):
+            return FSDPParallelPlan(
+                sp_size=2, tp_size=2,
+                tensor_parallel_plan=TensorParallelPlanSpec(plan={"default_projection": ColwiseParallel()}),
+            )
+
+    class SecondPlanModel(DefaultPlanModel):
+        @classmethod
+        def get_default_parallel_plan(cls, **kwargs):
+            return FSDPParallelPlan(
+                sp_size=2, tp_size=2,
+                tensor_parallel_plan=TensorParallelPlanSpec(plan={"second_projection": ColwiseParallel()}),
+            )
+
+    engine = dummy_engine
+    custom = provenance == "caller_override"
+    caller_plan = None
+    if provenance != "no_caller_plan":
+        caller_plan = FSDPParallelPlan(sp_size=2, tp_size=2)
+        if custom:
+            caller_plan.tensor_parallel_plan.plan["caller_projection"] = RowwiseParallel()
+    engine.config.parallel_plan = caller_plan
+    monkeypatch.setattr(engine, "_patch_transformers", lambda: None)
+    monkeypatch.setattr(engine, "_log_model_info", lambda model: None)
+    monkeypatch.setattr(engine_core.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        engine.backend._checkpoint, "load_hf",
+        lambda model, *args, **kwargs: model.to_empty(device="cpu"),
+    )
+    logs = []
+    monkeypatch.setattr(
+        engine_core, "logger",
+        SimpleNamespace(info_rank0=lambda message, *args: logs.append((message, args))),
+    )
+    layout = {
+        "layout_schema_version": 1, "expert_layout_version": "packed_2d_v1",
+        "topology": {"world_size": 4, "sp_size": 2, "tp_size": 2, "ep_size": 1, "etp_size": 1},
+        "parameters": [],
+    }
+    prepared = engine.prepare_model("local_model", model_cls=DefaultPlanModel,
+                                    init_kwargs={"config": PretrainedConfig()})
+    metadata = build_metadata(prepared, engine.config, "local_model", parallel_layout=layout)
+    assert metadata["engine_config"]["custom_tensor_parallel_plan"] is custom
+    assert metadata["engine_config"]["parallel_plan"] == {"sp_size": 2, "tp_size": 2, "ep_size": 1, "etp_size": 1}
+    assert engine.config.parallel_plan is caller_plan
+    if caller_plan is not None:
+        assert set(caller_plan.tensor_parallel_plan.plan) == ({"caller_projection"} if custom else set())
+    summary = next(args[0] for message, args in logs if message == "EngineConfig:\n%s")
+    logged = json.loads(summary)["parallel_plan"]
+    assert set(logged["tensor_parallel_plan"]["plan"]) == ({"default_projection", "caller_projection"} if custom else {"default_projection"})
+    engine.prepare_model("second_model", model_cls=SecondPlanModel,
+                         init_kwargs={"config": PretrainedConfig()})
+    assert set(engine.parallel_plan.tensor_parallel_plan.plan) == ({"second_projection", "caller_projection"} if custom else {"second_projection"})
+    assert engine.parallel_plan.tp_size == 2
+    assert engine.parallel_plan.sp_size == 2
+
+
+def test_legacy_summary_keeps_resolved_parallel_plan_on_config(dummy_engine, monkeypatch):
+    from torchturbo.parallel import FSDPParallelPlan
+    engine = dummy_engine
+    resolved = FSDPParallelPlan(sp_size=2, ep_size=2)
+    engine.parallel_plan = resolved
+    engine.model = TinyModel()
+    monkeypatch.setattr(engine, "_log_model_info", lambda model: None)
+    engine._log_info()
+    assert engine.config.parallel_plan is resolved
+
+
+def test_native_tp_sp_explicit_ga_uses_logical_microbatches_without_gbs():
+    engine, restore = _make_engine_for_ga(sp_size=2, world_size=8, tp_size=2)
+    try:
+        assert engine.resolve_gradient_accumulation_steps(3) == 3
+    finally:
+        restore()
+
+
+@pytest.mark.parametrize("data_rank,expected", [
+    (0, [[0, 1, 2], [6, 7, 8]]),
+    (1, [[3, 4, 5], [9, 10, 11]]),
+])
+def test_tp_no_gbs_sampler_drops_incomplete_logical_microbatch(monkeypatch, data_rank, expected):
+    engine = TorchTurboEngine.__new__(TorchTurboEngine)
+    engine.config = SimpleNamespace(gbs=None)
+    engine.get_dp_info = lambda: {"dp_size": 2, "dp_rank": data_rank}
+    engine.get_sp_info = lambda: {"sp_size": 2}
+    engine.get_tp_info = lambda: {"tp_size": 2}
+    monkeypatch.setattr(engine_core.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(engine_core.dist, "get_rank", lambda: data_rank * 4)
+    loader = engine.create_dataloader(list(range(17)), batch_size=3, shuffle=False,
+                                      drop_last=True, pin_memory=False)
+    assert [batch.tolist() for batch in loader] == expected
+    assert loader.sampler.total_size == 12
+
+
+@pytest.mark.parametrize("data_rank,expected", [
+    (0, [[0, 1, 8]]),
+    (1, [[2, 3, 10]]),
+])
+def test_legacy_sp_no_gbs_sampler_preserves_full_world_sweep(monkeypatch, data_rank, expected):
+    engine = TorchTurboEngine.__new__(TorchTurboEngine)
+    engine.config = SimpleNamespace(gbs=None)
+    engine.get_dp_info = lambda: {"dp_size": 4, "dp_rank": data_rank}
+    engine.get_sp_info = lambda: {"sp_size": 2}
+    engine.get_tp_info = lambda: {"tp_size": 1}
+    monkeypatch.setattr(engine_core.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(engine_core.dist, "get_rank", lambda: data_rank * 2)
+    loader = engine.create_dataloader(list(range(17)), batch_size=3, shuffle=False,
+                                      drop_last=True, pin_memory=False)
+    assert [batch.tolist() for batch in loader] == expected
+    assert loader.sampler.total_size == 16

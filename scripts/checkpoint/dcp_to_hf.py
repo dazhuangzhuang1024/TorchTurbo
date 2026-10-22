@@ -180,11 +180,30 @@ def build_export_config(
         tt_args.backend = saved["backend"]
     if tt_args.mixed_precision is None:
         tt_args.mixed_precision = saved["mixed_precision"]
-    tt_args.ep_size = saved["parallel_plan"]["ep_size"]
+    degrees = ("ep_size",)
+    if metadata["schema_version"] == 2:
+        degrees = ("sp_size", "tp_size", "ep_size", "etp_size")
+    for degree in degrees:
+        # Args are the base layer; explicit CLI, environment and file values
+        # still take precedence and are checked after config reconstruction.
+        if degree == "sp_size":
+            tt_args.sp_size = saved["parallel_plan"][degree]
+        elif degree == "tp_size":
+            tt_args.tp_size = saved["parallel_plan"][degree]
+        elif degree == "ep_size":
+            tt_args.ep_size = saved["parallel_plan"][degree]
+        else:
+            tt_args.etp_size = saved["parallel_plan"][degree]
     tt_args.enable_mtp = saved["mtp"]["enabled"]
     config = build_from_args(tt_args)
-    if config.parallel_plan.ep_size != saved["parallel_plan"]["ep_size"]:
-        raise ValueError("Export EP size must match the saved checkpoint.")
+    current_degrees = {
+        "sp_size": config.parallel_plan.sp_size, "tp_size": config.parallel_plan.tp_size,
+        "ep_size": config.parallel_plan.ep_size, "etp_size": config.parallel_plan.etp_size,
+    }
+    for degree in degrees:
+        if current_degrees[degree] != saved["parallel_plan"][degree]:
+            label = degree.removesuffix("_size").upper()
+            raise ValueError(f"Export {label} size must match the saved checkpoint.")
     if config.mtp.enabled != saved["mtp"]["enabled"]:
         raise ValueError("Export MTP setting must match the saved checkpoint.")
     return config
@@ -214,6 +233,37 @@ def main(argv: list[str] | None = None) -> None:
     init_process_group_if_needed(enable_cpu_backend=True)
     try:
         metadata = rank_zero_call(lambda: load_metadata(args.checkpoint_dir))
+        if metadata is not None and metadata["schema_version"] == 2:
+            saved_world = metadata["parallel_layout"]["topology"]["world_size"]
+            if dist.get_world_size() != saved_world:
+                raise ValueError(f"Export WORLD must equal saved WORLD ({saved_world}).")
+            saved_layout = metadata["parallel_layout"]
+            if (
+                saved_layout["layout_schema_version"] != 1
+                or saved_layout["expert_layout_version"] not in ("packed_2d_v1", "gated_logical_v1")
+            ):
+                raise ValueError("Export requires a supported TP checkpoint layout.")
+            topology = saved_layout["topology"]
+            sp, tp, ep, etp = (topology[name] for name in ("sp_size", "tp_size", "ep_size", "etp_size"))
+            if (
+                min(sp, tp, ep, etp) < 1
+                or saved_world % (sp * tp) != 0
+                or saved_world % (ep * etp) != 0
+                or (tp == 1 and etp != 1)
+                or (saved_layout["expert_layout_version"] == "gated_logical_v1"
+                    and not (tp == etp and etp > 1))
+                or (saved_layout["expert_layout_version"] == "packed_2d_v1"
+                    and tp > 1 and (ep != 1 or etp != 1))
+            ):
+                raise ValueError(
+                    "Export requires a supported topology with aligned TP=ETP for logical "
+                    "experts, EP=ETP=1 for packed layouts under TP, and ETP=1 when TP=1."
+                )
+            if metadata["engine_config"]["custom_tensor_parallel_plan"]:
+                raise ValueError(
+                    "Export requires the custom Python TP plan to be provided again "
+                    "by a caller. The standalone CLI cannot reconstruct that plan."
+                )
         source_path = args.model_name_or_path
         if source_path is None and metadata is not None:
             source_path = metadata["source_path"]

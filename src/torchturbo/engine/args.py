@@ -91,11 +91,14 @@ class TorchTurboArgs:
         Sequence parallelism group size.
     ep_size:
         Expert parallelism group size.
+    tp_size:
+        Tensor parallelism group size.
+    etp_size:
+        Expert tensor parallelism group size.
     gbs:
-        Global batch size in micro-batch units. When set, the engine derives
-        ``gradient_accumulation_steps = gbs * sp_size / world_size`` (overriding
-        the framework's own), letting the SP dimension control the effective
-        global batch size.
+        Global logical microbatch count. When set, the engine derives
+        ``gradient_accumulation_steps = gbs / data_dp_size =
+        gbs * sp_size * tp_size / world_size`` (overriding the framework's own).
     gradient_checkpointing:
         Whether TorchTurbo should enable engine-owned activation
         checkpointing. Defaults to ``True``.
@@ -109,7 +112,7 @@ class TorchTurboArgs:
     enable_mtp:
         Whether to build Multi-Token-Prediction (MTP) layers.  ``True``
         opts in: build MTP heads, load their weights, run forward, compute
-        loss.  ``False`` (default) — MTP is OFF
+        loss.  ``False`` (default) -- MTP is OFF
         (``num_nextn_predict_layers`` is overridden to 0).
     mtp_loss_scaling_factor:
         Weight applied to each MTP head's loss before adding to the main
@@ -166,6 +169,8 @@ class TorchTurboArgs:
     use_deterministic_algorithms: bool = False
     sp_size: int | None = None
     ep_size: int | None = None
+    tp_size: int | None = None
+    etp_size: int | None = None
     gbs: int | None = None
     gradient_checkpointing: bool = True
     ac_use_reentrant: bool = False
@@ -327,6 +332,26 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         help="Expert parallelism group size. Replaces TORCH_TURBO_EP_SIZE.",
     ),
     TurboArgSpec(
+        name="tp_size",
+        args_name="tp_size",
+        cli_name="--tt_tp_size",
+        env_name="TORCH_TURBO_TP_SIZE",
+        config_path="parallel_plan.tp_size",
+        type=int,
+        metavar="SIZE",
+        help="Tensor parallelism group size. Replaces TORCH_TURBO_TP_SIZE.",
+    ),
+    TurboArgSpec(
+        name="etp_size",
+        args_name="etp_size",
+        cli_name="--tt_etp_size",
+        env_name="TORCH_TURBO_ETP_SIZE",
+        config_path="parallel_plan.etp_size",
+        type=int,
+        metavar="SIZE",
+        help="Expert tensor parallelism group size. Replaces TORCH_TURBO_ETP_SIZE.",
+    ),
+    TurboArgSpec(
         name="gbs",
         args_name="gbs",
         cli_name="--tt_gbs",
@@ -334,10 +359,10 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         config_path="gbs",
         type=int,
         metavar="GBS",
-        help="Global batch size in micro-batch units. When set, "
-        "gradient_accumulation_steps is derived as tt_gbs * sp_size / "
-        "world_size (overriding the framework's own ga/gbs), so the SP "
-        "dimension controls the effective global batch size. "
+        help="Global logical microbatch count. When set, "
+        "gradient_accumulation_steps is derived as tt_gbs / data_dp_size = "
+        "tt_gbs * sp_size * tp_size / world_size "
+        "(overriding the framework's own ga/gbs). "
         "Replaces TORCH_TURBO_GBS.",
     ),
     TurboArgSpec(
@@ -815,6 +840,8 @@ def parse_torchturbo_args(argv: list[str]) -> tuple[TorchTurboArgs, list[str]]:
             args.optimizer_name,
             args.sp_size,
             args.ep_size,
+            args.tp_size,
+            args.etp_size,
             args.cpu_offload_enabled,
             args.enable_mtp,
             args.mtp_loss_scaling_factor,

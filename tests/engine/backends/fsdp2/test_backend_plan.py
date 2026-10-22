@@ -19,6 +19,7 @@ import torch.nn as nn
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 from torchturbo.engine.backends.fsdp2.config import CPUOffloadMode
 from torchturbo.engine.model_fqn import build_model_fqn_map
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBalanceIO
 from torchturbo.parallel import (
     FSDPParallelPlan,
@@ -58,6 +59,8 @@ def module_tags(module):
 
 def make_backend(*, mtp_enabled=False):
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parameter_ownership = ParameterOwnership()
+    backend._parallel_context = None
     backend.config = types.SimpleNamespace(
         mtp=types.SimpleNamespace(enabled=mtp_enabled),
         loss_chunk=types.SimpleNamespace(enabled=False),
@@ -94,6 +97,188 @@ def resolve_plan(model, plan=None):
     return FSDP2Backend._compile_parallel_plan(
         plan,
         build_model_fqn_map(model),
+    )
+
+
+def _run_ownership_test(rank, init_file):
+    from datetime import timedelta
+    from peft.tuners.lora import Linear
+    from peft.utils.other import ModulesToSaveWrapper
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, Shard
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.parallel import FSDPPlacementSpec
+    from torchturbo.runtime.cpu import CpuRuntime
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        for ep_size in (1, 2):
+            model = TaggedModule("root")
+            model.weight = nn.Parameter(torch.ones(4, 2))
+            model.experts = TaggedModule("experts")
+            model.experts.weight = nn.Parameter(torch.ones(4, 2))
+            model.experts.ignored = nn.Parameter(torch.ones(2))
+            model.experts.dense = nn.Linear(2, 4, bias=False)
+            model.experts.adapter = Linear(nn.Linear(2, 4, bias=False), "default", r=2)
+            model.layers = nn.ModuleList([TaggedModule("layer")])
+            model.layers[0].weight = nn.Parameter(torch.ones(4, 2))
+            model.layers[0].experts = nn.Linear(2, 4, bias=False)
+            model.saved = ModulesToSaveWrapper(nn.Linear(2, 4, bias=False), "default")
+            plan = FSDPParallelPlan(ep_size=ep_size, plan={
+                "experts": FSDPPlacementSpec(Shard(0), "edp"),
+                "experts.ignored": FSDPPlanSpec(no_shard=True),
+                "experts.dense": FSDPPlanSpec(standalone_world_shard=True),
+                "experts.adapter.weight": FSDPPlanSpec(no_shard=True),
+                "layers.0.experts": FSDPPlacementSpec(Shard(0), "edp"),
+                "saved": FSDPPlacementSpec(Shard(0), "edp"),
+            })
+            backend = FSDP2Backend(EngineConfig(), CpuRuntime())
+            backend._init_mesh(plan)
+            resolved = resolve_plan(model, plan)
+            backend._resolved_parallel_plan = resolved
+            backend._shard_model(model, resolved)
+            ownership = backend._parameter_ownership
+            manager = backend.create_checkpoint_manager()
+            assert manager._dcp.ownership is ownership
+            expected = {
+                "experts.weight",
+                "experts.adapter.lora_A.default.weight",
+                "experts.adapter.lora_B.default.weight",
+                "layers.0.experts.weight",
+                "saved.modules_to_save.default.weight",
+            }
+            assert ownership.expert_fqns(model) == expected
+            for name, parameter in model.named_parameters():
+                assert ownership.is_expert(parameter) == (name in expected), name
+            assert not isinstance(model.experts.ignored, DTensor)
+            assert not isinstance(model.experts.adapter.base_layer.weight, DTensor)
+            assert isinstance(model.experts.dense.weight, DTensor)
+            assert isinstance(model.saved.original_module.weight, DTensor)
+
+            old_expert = model.experts.weight
+            state = {name: value.clone() for name, value in model.state_dict().items()}
+            model.load_state_dict(state, assign=True)
+            backend.finalize_model_load(model)
+            assert ownership.is_expert(model.experts.weight)
+            assert not ownership.is_expert(old_expert)
+            assert backend._parameter_ownership is ownership
+            assert manager._dcp.ownership.expert_fqns(model) == expected
+
+            groups = backend._split_optimizer_groups_by_topology([
+                {"params": list(model.parameters()), "lr": 0.1},
+            ])
+            expert_ids = {id(model.get_parameter(name)) for name in expected}
+            assert {id(parameter) for parameter in groups[1]["params"]} == expert_ids
+            assert all(group["lr"] == 0.1 for group in groups)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
+def test_ownership_follows_actual_fsdp_units_and_rebinds_after_load(tmp_path):
+    pytest.importorskip("peft")
+    torch.multiprocessing.spawn(
+        _run_ownership_test, args=(str(tmp_path / "init"),), nprocs=2, join=True,
+    )
+
+
+def _run_two_model_ownership_test(rank, init_file, checkpoint_dir):
+    from peft.tuners.lora import Linear
+    import torch.distributed as dist
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.tensor import DTensor, Shard
+
+    from torchturbo.engine.config import EngineConfig
+    from torchturbo.parallel import FSDPPlacementSpec
+    from torchturbo.runtime.cpu import CpuRuntime
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2,
+    )
+    try:
+        backend = FSDP2Backend(EngineConfig(), CpuRuntime())
+        models = []
+        for expert_name in ("shared", "other"):
+            model = TaggedModule("root")
+            model.config = types.SimpleNamespace()
+            model.shared = Linear(nn.Linear(2, 4, bias=False), "default", r=2)
+            model.other = nn.Linear(2, 4, bias=False)
+            model.ignored = nn.Parameter(torch.ones(2))
+            plan = FSDPParallelPlan(ep_size=2, plan={
+                expert_name: FSDPPlacementSpec(Shard(0), "edp"),
+                "ignored": FSDPPlanSpec(no_shard=True),
+            })
+            backend.prepare_model(model, plan)
+            backend.finalize_model_load(model)
+            if not models:
+                manager = backend.create_checkpoint_manager()
+            models.append(model)
+
+        for index, model in enumerate(models):
+            expert_module = model.shared if index == 0 else model.other
+            expert_ids = {id(parameter) for parameter in expert_module.parameters()}
+            groups = backend._split_optimizer_groups_by_topology([
+                {"params": list(model.parameters())},
+            ])
+            assert len(groups) == 3
+            assert {id(parameter) for parameter in groups[1]["params"]} == expert_ids
+            for parameter in model.parameters():
+                parameter.grad = torch.ones_like(parameter)
+            norm = backend.clip_grad_norm_(model.parameters(), max_norm=100.0)
+            expected_square = 0.0
+            for parameter in model.parameters():
+                is_expert = id(parameter) in expert_ids
+                magnitude = 0.5 if is_expert else 1.0
+                copies = 2 if is_expert else 1
+                expected_square += parameter.numel() * copies * magnitude ** 2
+                gradient = parameter.grad
+                if isinstance(gradient, DTensor):
+                    gradient = gradient.to_local()
+                torch.testing.assert_close(gradient, torch.full_like(gradient, magnitude))
+            torch.testing.assert_close(norm, torch.tensor(expected_square).sqrt())
+            directory = os.path.join(checkpoint_dir, str(index))
+            manager.save_native(model, directory)
+            keys = set(FileSystemReader(directory).read_metadata().state_dict_metadata)
+            expected_keys = set()
+            for name, parameter in model.named_parameters():
+                if id(parameter) in expert_ids:
+                    expected_keys.update({f"model.{name}::ep0", f"model.{name}::ep1"})
+                else:
+                    expected_keys.add(f"model.{name}")
+            assert keys == expected_keys
+
+        first, second = models
+        old_expert = first.shared.base_layer.weight
+        first.load_state_dict(
+            {name: value.clone() for name, value in first.state_dict().items()},
+            assign=True,
+        )
+        backend.finalize_model_load(first)
+        ownership = backend._parameter_ownership
+        assert ownership is manager._dcp.ownership
+        assert ownership.is_expert(first.shared.base_layer.weight)
+        assert not ownership.is_expert(old_expert)
+        assert ownership.is_expert(second.other.weight)
+        assert not ownership.is_expert(second.shared.base_layer.weight)
+        assert manager._dcp._ep_partitioned_fqns(first) == {
+            "shared.base_layer.weight", "shared.lora_A.default.weight",
+            "shared.lora_B.default.weight",
+        }
+        assert manager._dcp._ep_partitioned_fqns(second) == {"other.weight"}
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is unavailable")
+def test_ownership_preserves_primary_and_reference_models(tmp_path):
+    pytest.importorskip("peft")
+    torch.multiprocessing.spawn(
+        _run_two_model_ownership_test,
+        args=(str(tmp_path / "init"), str(tmp_path / "checkpoint")),
+        nprocs=2, join=True,
     )
 
 
@@ -798,7 +983,7 @@ def test_chunked_loss_keeps_output_embedding_separate_from_tail_norm(
 
     monkeypatch.setattr(fsdp, "fully_shard", fake_fully_shard)
 
-    backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend = make_backend()
     backend._mesh = object()
     backend._world_mesh = "world"
     backend.mixed_precision = types.SimpleNamespace(value="no")

@@ -60,6 +60,7 @@ class BaseWeightConverter:
         self.ep_group = ep_info["ep_group"]
         self.ep_rank = ep_info["ep_rank"]
         self.ep_size = ep_info["ep_size"]
+        self.etp_size: int = parallel_context.get("etp", {}).get("etp_size", 1)
         self.moe_config = self.get_moe_config(model)
         self.config = config
         self.model_type = config.model_type
@@ -197,9 +198,37 @@ class BaseWeightConverter:
     def get_down_weight_bytes(self, element_size):
         return self.config.moe_intermediate_size * self.config.hidden_size * element_size
 
+    def _packed_expert_view(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """View the prepared logical grouped-expert layout at the HF boundary.
+
+        The aligned ETP path prepares homogeneous gated GroupedMLP modules.
+        Shape validation prevents equal-size buffers from silently changing the
+        gate/up or expert ordering. Legacy storage already uses packed matrices.
+        """
+        if self.etp_size == 1:
+            return tensor
+        num_local_experts = self.moe_config.num_moe_experts // self.ep_size
+        hidden_size = self.config.hidden_size
+        intermediate_size = self.config.moe_intermediate_size
+        if self.is_expert_weight1(name):
+            logical_shape = (num_local_experts * hidden_size, 2, intermediate_size)
+            packed_shape = (num_local_experts * hidden_size, 2 * intermediate_size)
+        elif self.is_expert_weight2(name):
+            logical_shape = (num_local_experts, intermediate_size, hidden_size)
+            packed_shape = (num_local_experts * intermediate_size, hidden_size)
+        else:
+            raise ValueError(f"Not an expert weight: {name}")
+        if tuple(tensor.shape) != logical_shape:
+            raise ValueError(
+                f"Expert {name} requires logical shape {logical_shape}, "
+                f"got {tuple(tensor.shape)}."
+            )
+        return tensor.view(packed_shape)
+
     def get_local_ep_w1_hf_state_dict(self, name, tensor):
         assert self.is_expert_weight1(name), "must be"
         assert self.moe_config != None, "must be"
+        tensor = self._packed_expert_view(name, tensor)
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
         experts = torch.split(tensor, self.config.hidden_size)
         start_index = self.ep_rank * num_local_experts
@@ -234,6 +263,7 @@ class BaseWeightConverter:
     def get_local_ep_w2_hf_state_dict(self, name, tensor):
         assert self.is_expert_weight2(name), "must be"
         assert self.moe_config != None, "must be"
+        tensor = self._packed_expert_view(name, tensor)
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
         start_index = self.ep_rank * num_local_experts
         prefix = name[:-8].replace(self.get_moe_expert_mlp_name(), self.get_hf_expert_mlp_name())
@@ -420,6 +450,7 @@ class BaseWeightConverter:
         Only the owner rank should call this.
         Pops consumed keys from local_sd.
         """
+        tensor = self._packed_expert_view(name, tensor)
         device, dtype = tensor.device, tensor.dtype
         gates, ups = self.convert_expert_weight1_to_hf(name, only_local_experts=True)
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
@@ -439,6 +470,7 @@ class BaseWeightConverter:
         Only the owner rank should call this.
         Pops consumed keys from local_sd.
         """
+        tensor = self._packed_expert_view(name, tensor)
         device, dtype = tensor.device, tensor.dtype
         downs = self.convert_expert_weight2_to_hf(name, only_local_experts=True)
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
@@ -608,6 +640,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if name in self._per_expert_fallback_names:
             return super().get_local_ep_w1_hf_state_dict(name, tensor)
         assert self.moe_config is not None, "must be"
+        tensor = self._packed_expert_view(name, tensor)
         hf_name = self.convert_expert_weight1_to_hf(name)
         tensor = tensor.to(self.get_default_hf_dtype(hf_name))
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
@@ -624,6 +657,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         if name in self._per_expert_fallback_names:
             return super().get_local_ep_w2_hf_state_dict(name, tensor)
         assert self.moe_config is not None, "must be"
+        tensor = self._packed_expert_view(name, tensor)
         hf_name = self.convert_expert_weight2_to_hf(name)
         tensor = tensor.to(self.get_default_hf_dtype(hf_name))
         num_local_experts = self.moe_config.num_moe_experts // self.ep_size
@@ -678,6 +712,8 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         Falls back to BaseWeightConverter per-expert logic when the fused key
         is not in param_to_filename (e.g. MTP layers in Qwen3.5).
         """
+        if name in self._per_expert_fallback_names:
+            return super().get_weight1_load_entries(name, param_to_filename)
         fused_name = self.convert_expert_weight1_to_hf(name)
         # Fallback: fused key not in checkpoint → per-expert format (e.g. MTP)
         if param_to_filename is not None and fused_name not in param_to_filename:
@@ -704,6 +740,8 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         Falls back to BaseWeightConverter per-expert logic when the fused key
         is not in param_to_filename (e.g. MTP layers in Qwen3.5).
         """
+        if name in self._per_expert_fallback_names:
+            return super().get_weight2_load_entries(name, param_to_filename)
         fused_name = self.convert_expert_weight2_to_hf(name)
         # Fallback: fused key not in checkpoint → per-expert format (e.g. MTP)
         if param_to_filename is not None and fused_name not in param_to_filename:
@@ -748,6 +786,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         """
         if name in self._per_expert_fallback_names:
             return super().assemble_weight1_for_broadcast(tensor, local_sd, name)
+        tensor = self._packed_expert_view(name, tensor)
         device, dtype = tensor.device, tensor.dtype
         fused_name = self.convert_expert_weight1_to_hf(name)
         virtual_key = self._make_virtual_key(fused_name)
@@ -766,6 +805,7 @@ class FusedExpertWeightConverter(BaseWeightConverter):
         """
         if name in self._per_expert_fallback_names:
             return super().assemble_weight2_for_broadcast(tensor, local_sd, name)
+        tensor = self._packed_expert_view(name, tensor)
         device, dtype = tensor.device, tensor.dtype
         fused_name = self.convert_expert_weight2_to_hf(name)
         virtual_key = self._make_virtual_key(fused_name)

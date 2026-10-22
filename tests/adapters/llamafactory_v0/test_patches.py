@@ -566,6 +566,7 @@ def test_packed_supervision_matches_trainer_count_and_backend_loss(
     reference_total = reference_losses[0] + sum(reference_losses[1:]) * 0.2
 
     backend = object.__new__(FSDP2Backend)
+    backend.get_tp_info = lambda: {"tp_size": 1}
     backend.config = SimpleNamespace(mtp=SimpleNamespace(enabled=num_predictions > 1))
     loss, components = backend._compute_lm_loss_with_sp(
         model=None,

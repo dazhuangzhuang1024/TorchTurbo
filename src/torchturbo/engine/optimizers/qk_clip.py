@@ -12,7 +12,7 @@ from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
 from ..model_fqn import ModelFQNMap
-from ..utils import match_fqn
+from ...utils.fqn import match_fqn
 
 if TYPE_CHECKING:
     from ..config import QKClipConfig

@@ -44,6 +44,10 @@ class BaseCheckpointManager(ABC):
     def optimizer_status(self, checkpoint_dir: str) -> ComponentStatus:
         """Return whether optimizer state is missing, incomplete, or complete."""
 
+    def checkpoint_layout(self, model: nn.Module) -> dict[str, Any] | None:
+        """Return backend layout metadata; distributed implementations may gather."""
+        return None
+
     def validate_optimizer_checkpoint(self) -> None:
         """Check local optimizer readiness before checkpoint I/O on any rank."""
 
@@ -208,6 +212,10 @@ class BaseBackend(ABC):
         Override in subclass for distributed backends.
         """
 
+    def get_tp_info(self) -> dict[str, Any]:
+        """Return the unpartitioned TP default for backends without tensor parallelism."""
+        return {"tp_rank": 0, "tp_size": 1, "tp_group": None}
+
     @abstractmethod
     def get_parallel_context(self) -> dict[str, Any]:
         """Return parallel-context dict of EP/SP/DP info.
@@ -218,6 +226,23 @@ class BaseBackend(ABC):
     def prepare_inputs(self, model: nn.Module, inputs: Any) -> Any:
         """Apply backend-specific input layout requirements before a step."""
         return inputs
+
+    def prepare_loss_targets(
+        self,
+        labels: torch.Tensor,
+        cu_seq_lens: torch.Tensor | None = None,
+        shift: int = 1,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        """Build exact full-row targets for step counting and loss computation.
+
+        A backend supporting exact TP SFT normalization must override this
+        capability and reuse it for the targets consumed by its loss.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support exact SFT target preparation "
+            "(prepare_loss_targets)"
+        )
 
     @abstractmethod
     def compute_loss(

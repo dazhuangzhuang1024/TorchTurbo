@@ -46,6 +46,7 @@ def test_compute_loss_passes_cu_through_backend_and_model(
             return torch.tensor(0.0)
 
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_tp_info = lambda: {"tp_size": 1}
     backend.get_sp_info = lambda: {"sp_size": sp_size}
     original_prepare = backend.prepare_inputs
 
@@ -105,6 +106,7 @@ def test_text_batch_without_positions_gets_contiguous_default():
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_tp_info = lambda: {"tp_size": 1}
     backend.get_sp_info = lambda: {"sp_size": 1, "sp_group": None, "sp_rank": 0}
     backend.config = SimpleNamespace(
         loss_chunk=SimpleNamespace(enabled=False),
@@ -144,6 +146,7 @@ def test_multimodal_batch_without_positions_keeps_none_for_mrope():
     from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
 
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_tp_info = lambda: {"tp_size": 1}
     backend.get_sp_info = lambda: {"sp_size": 1, "sp_group": None, "sp_rank": 0}
     backend.config = SimpleNamespace(
         loss_chunk=SimpleNamespace(enabled=False),

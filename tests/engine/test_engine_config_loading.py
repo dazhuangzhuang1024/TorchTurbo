@@ -42,6 +42,7 @@ from torchturbo.ops.base import OpPolicy
 from torchturbo.parallel import (
     FSDPParallelPlan,
     FSDPPlanSpec,
+    TensorParallelPlanSpec,
     VisionBalanceMode,
     VisionBalanceSpec,
 )
@@ -1382,3 +1383,92 @@ def test_gbs_negative_raises():
 def test_gbs_zero_raises():
     with pytest.raises(ValueError):
         build_from_args(TorchTurboArgs(gbs=0))
+
+
+@pytest.mark.parametrize("degree", ["tp_size", "etp_size"])
+def test_tensor_degrees_follow_cli_file_env_and_seed_precedence(tmp_path, monkeypatch, degree):
+    monkeypatch.setenv(f"TORCH_TURBO_{degree.upper()}", "2")
+    seed = TorchTurboArgs(**{degree: 3})
+    assert getattr(build_from_args(seed).parallel_plan, degree) == 2
+    path = _write(tmp_path, "tensor.yaml", _engine_config(f"parallel_plan:\n  {degree}: 4\n"))
+    seed.config_path = path
+    assert getattr(build_from_args(seed).parallel_plan, degree) == 4
+    args, remaining = parse_torchturbo_args(["--tt_config", path, f"--tt_{degree}", "8", "--other"])
+    assert remaining == ["--other"]
+    assert getattr(build_from_args(args).parallel_plan, degree) == 8
+
+
+def test_tensor_degree_defaults_are_independent():
+    cfg = build_from_args(TorchTurboArgs(tp_size=4))
+    assert cfg.parallel_plan.tp_size == 4
+    assert cfg.parallel_plan.etp_size == 1
+    assert FSDPParallelPlan(tp_size=4).etp_size == 1
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_from_dict_retains_all_four_degrees(nested):
+    degrees = dict(sp_size=2, ep_size=3, tp_size=4, etp_size=4)
+    cfg = EngineConfig.from_dict({"parallel_plan": degrees} if nested else degrees)
+    assert {key: getattr(cfg.parallel_plan, key) for key in degrees} == degrees
+
+
+def test_model_plan_merge_overrides_four_degrees_and_preserves_native_styles():
+    from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
+    class DensePlanModel(TurboModel):
+        @classmethod
+        def get_default_parallel_plan(cls, **kwargs):
+            return FSDPParallelPlan(
+                sp_size=9, ep_size=9, tp_size=9, etp_size=9,
+                tensor_parallel_plan=TensorParallelPlanSpec(plan={"up": ColwiseParallel(), "down": RowwiseParallel()}),
+            )
+
+    style = ColwiseParallel(use_local_output=False)
+    cfg = EngineConfig(parallel_plan=FSDPParallelPlan(
+        sp_size=2, ep_size=3, tp_size=4, etp_size=4,
+        tensor_parallel_plan=TensorParallelPlanSpec(plan={"up": style}),
+    ))
+    plan = _resolve_engine_plan(cfg, DensePlanModel)
+    assert (plan.sp_size, plan.ep_size, plan.tp_size, plan.etp_size) == (2, 3, 4, 4)
+    assert plan.tensor_parallel_plan.plan["up"] is style
+    assert isinstance(plan.tensor_parallel_plan.plan["down"], RowwiseParallel)
+    defaults = _resolve_engine_plan(build_from_args(), DensePlanModel)
+    assert (defaults.sp_size, defaults.ep_size, defaults.tp_size, defaults.etp_size) == (1, 1, 1, 1)
+
+
+@pytest.mark.parametrize("replace_validator", [False, True])
+def test_model_plan_merge_preserves_or_replaces_tensor_parallel_validator(replace_validator):
+    from torch import nn
+    from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+    from torchturbo.parallel import TensorParallelPlanSpec, TensorParallelValidator
+
+    class ModelValidator(TensorParallelValidator):
+        def validate(self, model: nn.Module, parallel_plan: FSDPParallelPlan) -> None:
+            pass
+
+    model_validator = ModelValidator()
+    override_validator = ModelValidator() if replace_validator else None
+    model_style = RowwiseParallel()
+    override_style = ColwiseParallel()
+
+    class DensePlanModel(TurboModel):
+        @classmethod
+        def get_default_parallel_plan(cls, **kwargs):
+            return FSDPParallelPlan(
+                tensor_parallel_plan=TensorParallelPlanSpec(
+                    plan={"up": ColwiseParallel(), "down": model_style},
+                    validator=model_validator,
+                ),
+            )
+
+    override_spec = TensorParallelPlanSpec(
+        plan={"up": override_style}, validator=override_validator,
+    )
+    cfg = EngineConfig(parallel_plan=FSDPParallelPlan(tensor_parallel_plan=override_spec))
+    plan = _resolve_engine_plan(cfg, DensePlanModel)
+
+    assert plan.tensor_parallel_plan.plan == {"up": override_style, "down": model_style}
+    expected_validator = override_validator if replace_validator else model_validator
+    assert plan.tensor_parallel_plan.validator is expected_validator
+    assert override_spec.plan == {"up": override_style}
+    assert override_spec.validator is override_validator

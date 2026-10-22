@@ -21,6 +21,7 @@ from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 
 def _backend(sp_size: int) -> FSDP2Backend:
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend.get_sp_info = lambda: {
         "sp_size": sp_size,
         "sp_group": None,

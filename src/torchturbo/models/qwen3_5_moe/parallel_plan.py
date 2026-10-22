@@ -1,11 +1,13 @@
 from typing import Any
 import torch.nn.functional as F
 
-from ...parallel import FSDPPlanSpec, FSDPParallelPlan
+from ...parallel import TensorParallelPlanSpec, FSDPPlanSpec, FSDPParallelPlan
 from ..modules.moe.moe_layer import MoELayer, MoEConfig, MoESubmodules
 from ..modules.moe.module import ModuleSpec
 from ..modules.moe.experts import GroupedMLP
 from ..modules.moe.config_converter import get_base_moe_config
+from torchturbo.engine.tensor_parallel.expert import GroupedMLPParallel
+from .tensor_parallel import Qwen3_5MoeTensorParallel, Qwen3_5MoeTensorParallelValidator
 
 
 def _is_qwen3_5_moe_module(module: Any) -> bool:
@@ -99,4 +101,13 @@ def get_parallel_plan() -> FSDPParallelPlan:
         },
         sp_size=1,
         ep_size=1,
+        tp_size=1,
+        etp_size=1,
+        tensor_parallel_plan=TensorParallelPlanSpec(
+            validator=Qwen3_5MoeTensorParallelValidator("model.language_model"),
+            plan={
+                "": Qwen3_5MoeTensorParallel("model.language_model"),
+                "model.language_model.layers.*.mlp.experts": GroupedMLPParallel(),
+            },
+        ),
     )

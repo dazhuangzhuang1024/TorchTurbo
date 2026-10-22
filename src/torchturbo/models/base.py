@@ -15,6 +15,7 @@ logger = get_logger(__name__)
 if TYPE_CHECKING:
     from ..engine.metrics.flops import BaseModelFlops
     from ..engine.optimizers import OptimizerRecipe
+    from ..parallel import FSDPParallelPlan
     from .modules.attention.ulysses import SequenceParallelInputSlicingSpec
     from .modules.moe.moe_layer import MoERuntimeInputs
 
@@ -92,10 +93,10 @@ class TurboModel:
             cls._restore_config_dtype(config, state)
 
     @classmethod
-    def get_default_parallel_plan(cls, **kwargs: Any):
+    def get_default_parallel_plan(cls, **kwargs: Any) -> FSDPParallelPlan:
         from torchturbo.parallel import FSDPParallelPlan
 
-        return FSDPParallelPlan()
+        return FSDPParallelPlan(sp_size=1, ep_size=1, tp_size=1, etp_size=1)
 
     def get_sp_attention_config(self) -> Any:
         """Config object whose ``_attn_implementation`` drives text attention."""
@@ -104,8 +105,8 @@ class TurboModel:
     def register_sp_attention_interface(self, sp_info: dict[str, Any]) -> None:
         """Enable the registered ``turbo_ulysses`` interface for SP attention.
 
-        Dispatch is per-config: the interface is registered in
-        ``ALL_ATTENTION_FUNCTIONS`` and bound to the SP group here, and the
+        Dispatch is per attention module: the stateless interface is registered
+        in ``ALL_ATTENTION_FUNCTIONS`` and the owned modules bind the SP group;
         text config switches to it. Subconfigs that keep their own
         implementation (e.g. VLM vision towers on ``flash_attention_2``)
         stay on the native flash path. Only families whose attention
@@ -118,20 +119,27 @@ class TurboModel:
         Registration does not depend on the SP size: at SP=1 the interface
         skips the collectives and runs the same flash-attention path, while
         still recording QK-clip statistics for modules that carry them.
+        Owned modules must exist at registration; rebind after reconstructing them.
         """
         from .modules.attention.ulysses import register_turbo_ulysses_attention
 
+        attn_config = self.get_sp_attention_config()
         register_turbo_ulysses_attention(
-            self.get_sp_attention_config(),
+            attn_config,
             sp_info["sp_group"],
             sp_info["sp_size"],
+            attention_modules=tuple(self.modules()),
         )
 
     def on_parallelized(self, parallel_context: dict[str, Any]) -> None:
         """Hook called after backend module replacement/sharding."""
 
     def on_materialized(self) -> None:
-        """Hook called after parameters and buffers are on a real device."""
+        """Rebuild runtime buffers after parameters and buffers reach a real device.
+
+        Preserve FSDP-managed parameter objects. Aliases may be tied to an
+        existing managed parameter, but must not create replacement parameters.
+        """
 
     def get_moe_runtime_inputs(
         self,

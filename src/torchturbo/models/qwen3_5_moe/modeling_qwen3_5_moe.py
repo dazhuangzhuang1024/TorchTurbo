@@ -540,7 +540,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         cu_seq_lens: torch.Tensor | None = None,
     ):
         from torchturbo.ops import ops
+        from .tensor_parallel import gated_norm, local_gdn_parameters
 
+        conv_weight, A_log, dt_bias = local_gdn_parameters(self)
         # Set up dimensions for reshapes later
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -582,7 +584,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 cache_params.conv_states[self.layer_idx] = conv_state
             mixed_qkv, _ = ops.causal_conv1d(
                 x=mixed_qkv,  # [B, T, D]
-                weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
+                weight=conv_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=self.conv1d.bias,
                 activation=self.activation,
                 initial_state=None,
@@ -606,7 +608,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
         if self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -644,7 +646,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = gated_norm(self, core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         output = self.out_proj(core_attn_out)

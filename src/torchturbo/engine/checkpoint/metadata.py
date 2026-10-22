@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 METADATA_FILE = "checkpoint.json"
 SCHEMA_VERSION = 1
+TP_SCHEMA_VERSION = 2
 
 # PEFT config fields that may change when resuming: bookkeeping that differs
 # across environments or PEFT versions, training-only settings, and
@@ -56,7 +57,8 @@ def _model_peft_configs(model: nn.Module) -> dict[str, Any]:
 
 
 def build_metadata(
-    model: nn.Module, config: EngineConfig, source_path: str
+    model: nn.Module, config: EngineConfig, source_path: str,
+    *, parallel_layout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Capture the source, model configuration, and reconstruction settings.
 
@@ -66,6 +68,10 @@ def build_metadata(
     """
     if os.path.isdir(source_path):
         source_path = os.path.realpath(source_path)
+    ep_size = (
+        parallel_layout["topology"]["ep_size"] if parallel_layout is not None
+        else config.parallel_plan.ep_size
+    )
     data = {
         "schema_version": SCHEMA_VERSION,
         "source_path": source_path,
@@ -73,13 +79,52 @@ def build_metadata(
         "engine_config": {
             "backend": config.backend.value,
             "mixed_precision": config.mixed_precision.value,
-            "parallel_plan": {"ep_size": config.parallel_plan.ep_size},
+            "parallel_plan": {"ep_size": ep_size},
             "mtp": dataclasses.asdict(config.mtp),
             "freeze_policy": dataclasses.asdict(config.freeze_policy),
         },
         "peft_configs": _model_peft_configs(model),
     }
+    if parallel_layout is not None:
+        data["schema_version"] = TP_SCHEMA_VERSION
+        data["parallel_layout"] = parallel_layout
+        data["engine_config"]["parallel_plan"] = {
+            name: parallel_layout["topology"][name]
+            for name in ("sp_size", "tp_size", "ep_size", "etp_size")
+        }
+        # On the TP path the engine config retains caller overrides; model
+        # defaults are reconstructed by the model class during export.
+        data["engine_config"]["custom_tensor_parallel_plan"] = bool(
+            config.parallel_plan is not None
+            and (
+                config.parallel_plan.tensor_parallel_plan.plan
+                or config.parallel_plan.tensor_parallel_plan.validator is not None
+            )
+        )
     return json.loads(json.dumps(data, default=_json_default))
+
+
+def validate_parallel_layout(
+    saved: dict[str, Any] | None, current: dict[str, Any] | None
+) -> None:
+    """Reject native TP topology or layout migration before tensor mutation."""
+    if saved is None or saved["schema_version"] == SCHEMA_VERSION:
+        if current is not None:
+            raise ValueError(
+                "Native TP restore requires schema 2 layout metadata. Export the "
+                "legacy DCP checkpoint to HF and load its weights in a new run."
+            )
+        return
+    expected = saved["parallel_layout"]
+    if current is None:
+        raise ValueError("Checkpoint topology and layout require the saved TP configuration.")
+    for field in ("topology", "layout_schema_version", "expert_layout_version", "parameters"):
+        if expected[field] != current[field]:
+            raise ValueError(
+                f"Checkpoint {field} layout differs from the current prepared model. "
+                "Native TP restore requires the same topology, parameter layouts, "
+                "and ownership. Export to HF for weights-only migration."
+            )
 
 
 def save_metadata(data: dict[str, Any], checkpoint_dir: str) -> None:
@@ -97,8 +142,17 @@ def load_metadata(checkpoint_dir: str) -> dict[str, Any] | None:
     try:
         with open(os.path.join(directory, METADATA_FILE)) as file:
             data = json.load(file)
-        if data["schema_version"] != SCHEMA_VERSION:
+        if data["schema_version"] not in (SCHEMA_VERSION, TP_SCHEMA_VERSION):
             raise ValueError(f"Unsupported checkpoint schema {data['schema_version']!r}")
+        if data["schema_version"] == TP_SCHEMA_VERSION:
+            layout = data["parallel_layout"]
+            for field in ("topology", "layout_schema_version", "expert_layout_version", "parameters"):
+                layout[field]
+            for degree in ("sp_size", "tp_size", "ep_size", "etp_size"):
+                if data["engine_config"]["parallel_plan"][degree] != layout["topology"][degree]:
+                    raise ValueError(
+                        f"Checkpoint {degree} topology disagrees with engine_config."
+                    )
         return data
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise RuntimeError(f"Invalid checkpoint metadata in {directory}: {exc}") from exc

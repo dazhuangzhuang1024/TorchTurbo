@@ -40,7 +40,7 @@ def _clean_registry(monkeypatch):
 
 
 class TestRegisterTurboUlyssesAttention:
-    def test_binds_partial_and_switches_config(self):
+    def test_binds_direct_config_and_switches_config(self, monkeypatch):
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
         config = _AttnConfig()
@@ -49,12 +49,20 @@ class TestRegisterTurboUlyssesAttention:
         register_turbo_ulysses_attention(config, sp_group, 2)
 
         entry = ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION]
-        assert entry.func is ulysses_module.ulysses_attention_forward
-        assert entry.keywords["sp_group"] is sp_group
-        assert entry.keywords["sp_size"] == 2
+        calls = []
+        def core(q, k, v, mask, length, **kwargs):
+            calls.append((kwargs["sp_group"], kwargs["sp_size"]))
+            return q
+        monkeypatch.setattr(ulysses_module, "ulysses_flash_attention_forward", core)
+        module = torch.nn.Module()
+        module.config = config
+        module.is_causal = True
+        query = torch.ones(1, 2, 3, 4, dtype=torch.bfloat16)
+        entry(module, query, query, query, None)
+        assert calls == [(sp_group, 2)]
         assert config._attn_implementation == TURBO_ULYSSES_ATTENTION
 
-    def test_base_method_registers_at_sp1(self):
+    def test_base_method_registers_at_sp1(self, monkeypatch):
         """SP=1 binds the same interface; it only skips the collectives.
 
         QK clipping records maximum logits through the interface, so the
@@ -62,9 +70,11 @@ class TestRegisterTurboUlyssesAttention:
         """
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-        class _Text(TurboModel):
+        class _Text(TurboModel, torch.nn.Module):
             def __init__(self) -> None:
+                torch.nn.Module.__init__(self)
                 self.config = _AttnConfig()
+                self.is_causal = True
 
         model = _Text()
         assert model.get_sp_attention_config() is model.config
@@ -72,9 +82,14 @@ class TestRegisterTurboUlyssesAttention:
         model.register_sp_attention_interface({"sp_group": None, "sp_size": 1})
 
         entry = ALL_ATTENTION_FUNCTIONS[TURBO_ULYSSES_ATTENTION]
-        assert entry.func is ulysses_module.ulysses_attention_forward
-        assert entry.keywords["sp_size"] == 1
-        assert entry.keywords["sp_group"] is None
+        calls = []
+        def core(q, k, v, mask, length, **kwargs):
+            calls.append((kwargs["sp_group"], kwargs["sp_size"]))
+            return q
+        monkeypatch.setattr(ulysses_module, "ulysses_flash_attention_forward", core)
+        query = torch.ones(1, 2, 3, 4, dtype=torch.bfloat16)
+        entry(model, query, query, query, None)
+        assert calls == [(None, 1)]
         assert model.config._attn_implementation == TURBO_ULYSSES_ATTENTION
 
     def test_engine_fa_binding_untouched(self):

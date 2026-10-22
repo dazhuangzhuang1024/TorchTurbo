@@ -243,6 +243,7 @@ def test_vision_balance_registration_preserves_forward_and_backward(
     reference = copy.deepcopy(tower)
     if checkpoint_mode is not None:
         backend = FSDP2Backend.__new__(FSDP2Backend)
+        backend._parallel_context = None
         backend.logger = logging.getLogger(__name__)
         backend.config = EngineConfig(
             activation_checkpointing=ActivationCheckpointingConfig(
@@ -1208,7 +1209,7 @@ def test_on_parallelized_switches_text_but_leaves_vision_alone(
         Qwen3VLMoeVisionAttention,
     )
 
-    model = make_model()
+    model = make_model(hybrid=True)
     patched = []
     monkeypatch.setattr(wrapper, "patch_rms_norm", lambda *args: None)
     monkeypatch.setattr(
@@ -1227,7 +1228,8 @@ def test_on_parallelized_switches_text_but_leaves_vision_alone(
     model.config.vision_config._attn_implementation = attn_implementation
     model.on_parallelized({"sp": {"sp_group": None, "sp_size": 1, "sp_rank": 0}})
 
-    assert patched == [(wrapper.BailingMoeV3KimiDeltaAttention, None, 1, 0)]
+    assert patched == [(layer.attention, None, 1, 0) for layer in model.model.layers
+                       if isinstance(layer.attention, wrapper.BailingMoeV3KimiDeltaAttention)]
     # Only the text config switches to the registered SP interface; the
     # vision tower keeps resolving its own subconfig implementation.
     assert registered == [(model.config.text_config, 1)]
@@ -1235,3 +1237,46 @@ def test_on_parallelized_switches_text_but_leaves_vision_alone(
     vision_attention = model.model.visual.blocks[0].attn
     assert vision_attention.config._attn_implementation == attn_implementation
     assert Qwen3VLMoeVisionAttention.__dict__.get("attention_interface") is None
+
+
+def test_cacheless_all_kda_prepared_moe_forward_backward(single_rank_group):
+    from torchturbo.engine.config import EngineConfig
+    from tests.models.bailing_hybrid.tp_helpers import cpu_bailing_leaves, make_bailing_model
+    from torchturbo.models.modules.moe.experts import GroupedMLP
+    from torchturbo.models.modules.moe.module import ModuleSpec
+    from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
+    from torchturbo.models.bailing_moe_v3_vl.parallel_plan import _replace_vl_moe
+
+    with cpu_bailing_leaves():
+        model = make_bailing_model("vl", layer_group_size=[1, 1], use_cache=False).train()
+        assert model.model.config.full_attention_layer_ids == []
+        assert [layer.attention_layer_type for layer in model.model.layers] == ["linear_attention", "linear_attention"]
+        original = model.model.layers[1].mlp
+        prepared = _replace_vl_moe(
+            original, hf_config=model.config, sp_info=dict(sp_group=None),
+            ep_info=dict(ep_group=torch.distributed.group.WORLD, ep_size=1),
+            moe_submodules=MoESubmodules(experts=ModuleSpec(module=GroupedMLP)),
+            engine_config=EngineConfig(),
+        )
+        assert isinstance(prepared, MoELayer)
+        with torch.no_grad():
+            for parameter in prepared.parameters():
+                values = torch.arange(parameter.numel()).reshape_as(parameter).float()
+                parameter.copy_(.15 * torch.sin(values * .17 + .31))
+            prepared.router.expert_bias.copy_(torch.linspace(-.05, .05, 8))
+        model.model.layers[1].mlp = prepared
+        model.on_parallelized({"sp": dict(sp_group=None, sp_size=1, sp_rank=0)})
+        boundaries = torch.tensor([0, 2, 5, 6], dtype=torch.int32)
+        output = model(input_ids=torch.tensor([[2, 3, 4, 5, 6, 7]]), use_cache=False,
+                       cu_seq_lens_q=boundaries, cu_seq_lens_k=boundaries,
+                       max_length_q=3, max_length_k=3)
+        assert torch.isfinite(output.logits).all()
+        target = torch.linspace(-.7, .9, output.logits.numel()).reshape_as(output.logits)
+        (output.logits * target).sum().backward()
+        for layer in model.model.layers:
+            for name, parameter in layer.attention.named_parameters():
+                assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+                assert parameter.grad.norm() > 0, name
+        assert prepared.router.weight.grad.norm() > 0
+        assert prepared.experts.weight1.grad.norm() > 0
+        assert prepared.experts.weight2.grad.norm() > 0

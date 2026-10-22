@@ -1,9 +1,11 @@
-from ...parallel import FSDPParallelPlan, FSDPPlanSpec
+from ...parallel import TensorParallelPlanSpec, FSDPParallelPlan, FSDPPlanSpec
 from ..modules.moe.config_converter import get_base_moe_config
 from ..modules.moe.experts import GroupedMLP
 from ..modules.moe.moe_layer import MoEConfig, MoELayer, MoESubmodules
 from ..modules.moe.module import ModuleSpec
 from ..qwen3_5_moe.parallel_plan import _replace_qwen3_5_moe_only
+from torchturbo.engine.tensor_parallel.expert import GroupedMLPParallel
+from ..qwen3_5_moe.tensor_parallel import Qwen3_5MoeTensorParallel, Qwen3_5MoeTensorParallelValidator
 
 
 def get_parallel_plan() -> FSDPParallelPlan:
@@ -36,4 +38,13 @@ def get_parallel_plan() -> FSDPParallelPlan:
         },
         sp_size=1,
         ep_size=1,
+        tp_size=1,
+        etp_size=1,
+        tensor_parallel_plan=TensorParallelPlanSpec(
+            validator=Qwen3_5MoeTensorParallelValidator("model"),
+            plan={
+                "": Qwen3_5MoeTensorParallel("model"),
+                "model.layers.*.mlp.experts": GroupedMLPParallel(),
+            },
+        ),
     )

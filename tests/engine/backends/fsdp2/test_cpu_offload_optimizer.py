@@ -322,6 +322,7 @@ def test_workspace_adamw_matches_adamw(monkeypatch):
 
 def test_prepare_optimizer_rejects_unsupported_optimizer():
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend.fsdp_config = FSDPConfig(
         cpu_offload=CPUOffloadConfig(
             enabled=True,
@@ -343,6 +344,7 @@ def test_prepare_optimizer_rejects_unsupported_optimizer():
 @requires_cpu_fused_adamw
 def test_prepare_optimizer_builds_adamw_swap():
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend.fsdp_config = FSDPConfig(
         cpu_offload=CPUOffloadConfig(
             enabled=True,
@@ -368,6 +370,7 @@ def test_prepare_optimizer_builds_adamw_swap():
 
 def test_prepare_optimizer_builds_host_update_adamw():
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend.fsdp_config = FSDPConfig(
         cpu_offload=CPUOffloadConfig(
             enabled=True,
@@ -392,6 +395,7 @@ def test_prepare_optimizer_builds_host_update_adamw():
 
 def test_prepare_optimizer_keeps_original_class_without_optimizer_offload():
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend.fsdp_config = FSDPConfig(
         cpu_offload=CPUOffloadConfig(enabled=True, mode="full")
     )

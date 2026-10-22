@@ -4,10 +4,10 @@ The DCP model state holds every ``model.state_dict()`` entry, including frozen
 parameters. Freezing does not imply that a weight still equals its source.
 
 Expert-parallel (EP) ranks hold different experts under the same FQN, and the
-DTensor placement only covers the edp mesh dim. DCP keys shards by
+DTensor placements cover only that partition's EDP/ETP mesh dimensions. DCP keys shards by
 ``(fqn, global_offset)``, so every EP rank computes the same key for its own
 experts and ``dedup_save_plans`` would keep the data of a single EP rank.
-Entries sharded on the edp mesh get an ``::ep<rank>`` suffix before they reach
+Entries owned by expert FSDP units get an ``::ep<rank>`` suffix before they reach
 DCP. Loading passes the populated state through ``model.load_state_dict()`` so
 model load hooks and extra state participate in restoration.
 """
@@ -25,10 +25,9 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
 
 from torchturbo.engine.optimizers import OptimizersContainer
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from ....checkpoint.distributed import collective_check
 from torchturbo.logging import get_logger
 
@@ -50,25 +49,29 @@ class DcpCheckpoint:
     Args:
         ep_rank: Rank of this process in its expert-parallel group.
         ep_size: Number of ranks in the expert-parallel group.
-        edp_mesh: Mesh that shards expert-parallel parameters.
+        ownership: Stable names of parameters owned by expert FSDP units.
     """
 
     _EP_SUFFIX = "::ep"
 
-    def __init__(self, ep_rank: int, ep_size: int, edp_mesh: DeviceMesh) -> None:
+    def __init__(
+        self, ep_rank: int, ep_size: int, ownership: ParameterOwnership,
+        *, stamp_all_aliases: bool = False
+    ) -> None:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
-        self.edp_mesh = edp_mesh
+        self.ownership = ownership
+        self.stamp_all_aliases = stamp_all_aliases
 
     # ------------------------------------------------------------------ #
     # EP-unique keys (private).
     # ------------------------------------------------------------------ #
     def _ep_partitioned_fqns(self, model: nn.Module) -> frozenset[str]:
         """Return FQNs whose shards repeat the same offsets on every EP rank."""
-        return frozenset(
-            fqn
-            for fqn, param in model.named_parameters()
-            if isinstance(param, DTensor) and param.device_mesh == self.edp_mesh
+        if self.stamp_all_aliases:
+            return self.ownership.expert_fqns(model)
+        return self.ownership.expert_fqns(model).intersection(
+            name for name, _ in model.named_parameters()
         )
 
     def _stamp_fqn(self, fqn: str, ep_fqns: frozenset[str]) -> str:
@@ -109,6 +112,84 @@ class DcpCheckpoint:
                 f"{sorted(saved_ranks)}, but the current run uses EP ranks "
                 f"{sorted(expected_ranks)}."
             )
+
+    def _validate_tensor_shapes(
+        self, metadata: dcp.Metadata, model: nn.Module, ep_fqns: frozenset[str],
+    ) -> None:
+        """Check model logical shapes before live tensors change."""
+        for name, parameter in model.state_dict().items():
+            if not isinstance(parameter, torch.Tensor):
+                continue
+            stamped = self._stamp_fqn(name, ep_fqns)
+            saved_key = f"{_MODEL_KEY}.{stamped}"
+            if saved_key not in metadata.state_dict_metadata:
+                continue
+            saved = metadata.state_dict_metadata[saved_key]
+            if (
+                isinstance(saved, dcp.TensorStorageMetadata)
+                and tuple(saved.size) != tuple(parameter.shape)
+            ):
+                raise ValueError(
+                    f"Checkpoint tensor {saved_key} shape {tuple(saved.size)} "
+                    f"differs from the current logical shape {tuple(parameter.shape)}."
+                )
+
+    def _validate_optimizer_state(
+        self, metadata: dcp.Metadata, model: nn.Module,
+        optimizers: torch.optim.Optimizer | tuple[torch.optim.Optimizer, ...],
+    ) -> None:
+        """Validate consumed AdamW leaves before native state initialization."""
+        names = {parameter: name for name, parameter in model.named_parameters()}
+        ep_fqns = self._ep_partitioned_fqns(model)
+        saved = metadata.state_dict_metadata
+        optimizers = optimizers if isinstance(optimizers, tuple) else (optimizers,)
+        group_index = 0
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                group_prefix = f"{_OPTIMIZER_KEY}.param_groups.{group_index}"
+                # PyTorch 2.10 DCP stores the list of parameter FQN strings as
+                # the terminal param_groups.<i>.params key, not indexed leaves.
+                required = [f"{group_prefix}.{field}" for field in group]
+                group_index += 1
+                missing = [key for key in required if key not in saved]
+                if missing:
+                    raise ValueError(
+                        f"Optimizer checkpoint is missing required entries: {missing}."
+                    )
+                if not isinstance(optimizer, torch.optim.AdamW):
+                    continue
+                for parameter in group["params"]:
+                    if not parameter.requires_grad and parameter not in optimizer.state:
+                        continue
+                    name = names[parameter]
+                    fqns = (
+                        [f"{name}{self._EP_SUFFIX}{rank}" for rank in range(self.ep_size)]
+                        if name in ep_fqns else [name]
+                    )
+                    prefixes = tuple(f"{_OPTIMIZER_KEY}.state.{fqn}." for fqn in fqns)
+                    if self.stamp_all_aliases and parameter.requires_grad and not any(
+                        key.startswith(prefixes) for key in saved
+                    ):
+                        # Adam creates a slot only on the first participating update.
+                        # Any present EP alias still requires every partition below.
+                        continue
+                    fields = ["step", "exp_avg", "exp_avg_sq"]
+                    if group["amsgrad"]:
+                        fields.append("max_exp_avg_sq")
+                    for fqn in fqns:
+                        for field in fields:
+                            key = f"{_OPTIMIZER_KEY}.state.{fqn}.{field}"
+                            if key not in saved:
+                                raise ValueError(
+                                    f"Optimizer checkpoint is missing required entry {key}."
+                                )
+                            if field == "step":
+                                continue
+                            if tuple(saved[key].size) != tuple(parameter.shape):
+                                raise ValueError(
+                                    f"Checkpoint tensor {key} shape {tuple(saved[key].size)} "
+                                    f"differs from the current logical shape {tuple(parameter.shape)}."
+                                )
 
     def _stamp_optim_state(self, optim_state: dict, ep_fqns: frozenset[str]) -> dict:
         new_state = {
@@ -162,6 +243,8 @@ class DcpCheckpoint:
         def preflight() -> None:
             metadata = FileSystemReader(dcp_dir).read_metadata()
             self._validate_ep_size(set(metadata.state_dict_metadata), ep_fqns, dcp_dir)
+            if self.stamp_all_aliases:
+                self._validate_tensor_shapes(metadata, model, ep_fqns)
             # Default DCP planners retain the original nested paths. Compare
             # model entries, not flattened leaf keys of dict-valued extra state.
             saved = {
@@ -237,16 +320,81 @@ class DcpCheckpoint:
         dcp_dir: str,
     ) -> None:
         """Restore optimizer state saved by :meth:`save_optimizer`."""
-        collective_check(lambda: FileSystemReader(dcp_dir).read_metadata())
-        options = StateDictOptions(full_state_dict=False)
         optimizers = self._unwrap_optimizer(optimizer)
+        metadata = None
+
+        def preflight() -> None:
+            nonlocal metadata
+            metadata = FileSystemReader(dcp_dir).read_metadata()
+            if self.stamp_all_aliases:
+                self._validate_optimizer_state(metadata, model, optimizers)
+
+        collective_check(preflight)
+        options = StateDictOptions(full_state_dict=False)
 
         optim_state = get_optimizer_state_dict(model, optimizers, options=options)
         stamped = self._stamp_optim_state(
             optim_state, self._ep_partitioned_fqns(model)
         )
+        if self.stamp_all_aliases:
+            saved = metadata.state_dict_metadata
+            stamped["state"] = {
+                fqn: slot for fqn, slot in stamped["state"].items()
+                if any(key.startswith(f"{_OPTIMIZER_KEY}.state.{fqn}.") for key in saved)
+            }
+
+            def validate_skeleton() -> None:
+                names = {parameter: name for name, parameter in model.named_parameters()}
+                ep_fqns = self._ep_partitioned_fqns(model)
+                children = optimizers if isinstance(optimizers, tuple) else (optimizers,)
+                for child in children:
+                    for group in child.param_groups:
+                        for parameter in group["params"]:
+                            if not parameter.requires_grad:
+                                continue
+                            fqn = self._stamp_fqn(names[parameter], ep_fqns)
+                            prefix = f"{_OPTIMIZER_KEY}.state.{fqn}."
+                            fields = {key[len(prefix):] for key in saved if key.startswith(prefix)}
+                            missing = fields - stamped["state"].get(fqn, {}).keys()
+                            if missing:
+                                raise ValueError(
+                                    f"Native optimizer skeleton lacks saved slot {fqn} "
+                                    f"fields {sorted(missing)}."
+                                )
+
+            collective_check(validate_skeleton)
         start = time.perf_counter()
         dcp.load({_OPTIMIZER_KEY: stamped}, checkpoint_id=dcp_dir)
+        if self.stamp_all_aliases:
+            def validate_membership() -> None:
+                names = {parameter: name for name, parameter in model.named_parameters()}
+                groups = [
+                    {self._strip_fqn(name) for name in group["params"]}
+                    for group in stamped["param_groups"]
+                ]
+                members = set().union(*groups)
+                children = optimizers if isinstance(optimizers, tuple) else (optimizers,)
+                group_index = 0
+                for child in children:
+                    for group in child.param_groups:
+                        for parameter in group["params"]:
+                            if not parameter.requires_grad:
+                                continue
+                            name = names[parameter]
+                            if name not in members:
+                                raise ValueError(
+                                    f"Saved optimizer groups lack current parameter {name}."
+                                )
+                            # Native set maps empty state groups by index, not FQN.
+                            if not stamped["state"] and name not in groups[group_index]:
+                                raise ValueError(
+                                    f"Empty optimizer state group {group_index} lacks "
+                                    f"current parameter {name}."
+                                )
+                        group_index += 1
+
+            collective_check(validate_membership)
+            options = StateDictOptions(full_state_dict=False, strict=False)
         set_optimizer_state_dict(
             model, optimizers, self._strip_optim_state(stamped), options=options
         )

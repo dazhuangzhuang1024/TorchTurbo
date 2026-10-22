@@ -640,8 +640,9 @@ class EngineConfig:
     """MFU/HFU reporting settings."""
 
     gbs: int | None = None
-    """Global batch size in micro-batch units (``--tt_gbs``). When set, the
-    engine derives ``gradient_accumulation_steps = gbs * sp_size / world_size``
+    """Global logical microbatch count (``--tt_gbs``). When set, the engine derives
+    ``gradient_accumulation_steps = gbs / data_dp_size =
+    gbs * sp_size * tp_size / world_size``.
     """
 
     plugin_paths: list[str] = field(default_factory=list)
@@ -708,6 +709,8 @@ class EngineConfig:
         parallel_sizes = {
             "sp_size": legacy_parallel.get("sp_size", d.get("sp_size", 1)),
             "ep_size": legacy_parallel.get("ep_size", d.get("ep_size", 1)),
+            "tp_size": legacy_parallel.get("tp_size", d.get("tp_size", 1)),
+            "etp_size": legacy_parallel.get("etp_size", d.get("etp_size", 1)),
         }
         parallel_d = d.get("parallel_plan")
         if isinstance(parallel_d, FSDPParallelPlan):
@@ -815,6 +818,7 @@ class EngineConfig:
             "checkpoint",
             "dp_size",
             "tp_size",
+            "etp_size",
             "ep_size",
             "pp_size",
             "sp_size",
@@ -1019,8 +1023,8 @@ def build_from_args(
                 "backend": "fsdp2",
                 # --- Mixed precision ---
                 "mixed_precision": "fp32",
-                # --- Parallel plan (sp / ep) ---
-                "parallel_plan": {"sp_size": 1, "ep_size": 1},
+                # --- Parallel degrees ---
+                "parallel_plan": {"sp_size": 1, "ep_size": 1, "tp_size": 1, "etp_size": 1},
                 # --- Backend config ---
                 "backend_config": {"reshard_after_forward": True},
             }
@@ -1114,11 +1118,13 @@ def build_from_args(
     )
 
     logger.info_rank0(
-        "Built EngineConfig from TorchTurboArgs: backend=%s, mp=%s, sp=%d, ep=%d",
+        "Built EngineConfig from TorchTurboArgs: backend=%s, mp=%s, sp=%d, ep=%d, tp=%d, etp=%d",
         config.backend.value,
         config.mixed_precision.value,
         config.parallel_plan.sp_size,
         config.parallel_plan.ep_size,
+        config.parallel_plan.tp_size,
+        config.parallel_plan.etp_size,
     )
     return config
 
@@ -1147,6 +1153,8 @@ def _parse_parallel_plan(parallel_d: Mapping[str, Any]) -> FSDPParallelPlan:
         plan=plan_entries,
         sp_size=parallel_d.get("sp_size", 1),
         ep_size=parallel_d.get("ep_size", 1),
+        tp_size=parallel_d.get("tp_size", 1),
+        etp_size=parallel_d.get("etp_size", 1),
     )
 
 

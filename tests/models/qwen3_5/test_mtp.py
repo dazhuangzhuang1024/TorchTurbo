@@ -82,6 +82,7 @@ def _batch():
 
 def _backend(chunked, scale):
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend.get_tp_info = lambda: {"tp_size": 1}
     backend.rank = 0
     backend.config = SimpleNamespace(
         loss_chunk=LossChunkConfig(enabled=chunked),

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from torch.distributed.tensor import DTensor
 
 from .moe_config import MoEConfig
 from torchturbo.ops import ops
@@ -185,7 +186,7 @@ class GroupedMLP(torch.nn.Module):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
-    ):
+    ) -> tuple[torch.Tensor, None]:
         """Forward step of the GroupedMLP."""
         if self.config.moe_apply_probs_on_input:
             assert (
@@ -213,6 +214,14 @@ class GroupedMLP(torch.nn.Module):
         if isinstance(tokens_per_expert, torch.Tensor) and tokens_per_expert.is_cuda:
             tokens_per_expert = tokens_per_expert.cpu()
 
+        if not (transformer_engine_is_available() and self.use_te):
+            weight1 = self.weight1
+            weight2 = self.weight2
+            if isinstance(weight1, DTensor):
+                weight1 = weight1.to_local()
+            if isinstance(weight2, DTensor):
+                weight2 = weight2.to_local()
+
         if permuted_local_hidden_states.nelement() != 0:
 
             if transformer_engine_is_available() and self.use_te:
@@ -231,10 +240,10 @@ class GroupedMLP(torch.nn.Module):
             else:
                 # Fall back to the grouped_matmul op registry.
                 # Reshape the weights for the grouped GEMMs.
-                w1 = self.weight1.view(
+                w1 = weight1.reshape(
                     self.num_local_experts, self.config.hidden_size, -1
                 )
-                w2 = self.weight2.view(
+                w2 = weight2.reshape(
                     self.num_local_experts, -1, self.config.hidden_size
                 )
 
@@ -252,10 +261,8 @@ class GroupedMLP(torch.nn.Module):
             assert torch.count_nonzero(tokens_per_expert) == 0
 
             # Make sure params of experts still have gradients even given zero tokens.
-            w1 = self.weight1.view(self.config.hidden_size, -1)
-            w2 = self.weight2.view(-1, self.config.hidden_size)
-            h = torch.matmul(permuted_local_hidden_states, w1)
-            h = self.activation_func_with_probs(h, permuted_probs.unsqueeze(-1))
-            fc2_output = torch.matmul(h, w2)
+            fc2_output = permuted_local_hidden_states + (
+                weight1.sum() + weight2.sum()
+            ) * 0
 
         return fc2_output, None

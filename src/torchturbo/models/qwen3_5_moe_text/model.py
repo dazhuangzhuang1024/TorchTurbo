@@ -44,17 +44,19 @@ class TurboQwen3_5MoeTextForCausalLM(TurboModel, Qwen3_5MoeTextForCausalLM):
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
+        if sp_size > 1 or parallel_context["tp"]["tp_size"] > 1:
+            self.register_sp_attention_interface(sp_info)
         if sp_size > 1:
             from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
                 Qwen3_5MoeGatedDeltaNet,
                 Qwen3_5MoeMultiTokenPredictor,
             )
 
-            self.register_sp_attention_interface(sp_info)
-
-            self.patch_gated_delta_net_for_sp(
-                Qwen3_5MoeGatedDeltaNet, sp_group, sp_size, sp_rank
-            )
+            for attention in self.modules():
+                if isinstance(attention, Qwen3_5MoeGatedDeltaNet):
+                    self.patch_gated_delta_net_for_sp(
+                        attention, sp_group, sp_size, sp_rank
+                    )
 
             if self.mtp is not None:
                 self.patch_mtp_for_sp(

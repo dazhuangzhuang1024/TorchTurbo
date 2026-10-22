@@ -2,9 +2,16 @@ from typing import Any
 
 import torch
 
-from ...parallel import FSDPParallelPlan, FSDPPlacementSpec, FSDPPlanSpec
+from ...parallel import (
+    TensorParallelPlanSpec,
+    FSDPParallelPlan,
+    FSDPPlacementSpec,
+    FSDPPlanSpec,
+)
+from torchturbo.engine.tensor_parallel.expert import GroupedMLPParallel
 from ..modules.moe.config_converter import get_base_moe_config
 from ..modules.moe.moe_layer import MoEConfig, MoELayer, MoESubmodules
+from .tensor_parallel import BailingTensorParallel, BailingTensorParallelValidator
 
 
 def _is_moe_module(module: Any) -> bool:
@@ -73,6 +80,13 @@ def get_parallel_plan() -> FSDPParallelPlan:
     moe_submodules = MoESubmodules(experts=ModuleSpec(module=GroupedMLP))
 
     return FSDPParallelPlan(
+        tensor_parallel_plan=TensorParallelPlanSpec(
+            validator=BailingTensorParallelValidator(),
+            plan={
+                "": BailingTensorParallel(),
+                "model.layers.*.mlp.experts": GroupedMLPParallel(),
+            },
+        ),
         plan={
             "model.layers.*.mlp.experts": FSDPPlanSpec(
                 placement=FSDPPlacementSpec(Shard(0), "edp"),
@@ -87,4 +101,6 @@ def get_parallel_plan() -> FSDPParallelPlan:
         },
         sp_size=1,
         ep_size=1,
+        tp_size=1,
+        etp_size=1,
     )

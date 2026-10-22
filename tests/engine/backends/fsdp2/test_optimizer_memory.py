@@ -1,10 +1,12 @@
 """Optimizer lifecycle, aliases, and continuation across inference windows."""
 
 import copy
+from datetime import timedelta
 import weakref
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
@@ -27,6 +29,10 @@ from torchturbo.engine.optimizers import (
     OptimizersContainer,
 )
 from torchturbo.models.modules.attention.qk_clip import get_qk_clip_state
+from torchturbo.engine.backends.fsdp2.parallel_context import (
+    ParallelContext,
+    ParameterOwnership,
+)
 from torchturbo.runtime import get_device_runtime
 from torchturbo.runtime.cpu import CpuRuntime
 
@@ -57,10 +63,28 @@ def runtime(request):
     pytest.skip("requires an accelerator for actual state migration")
 
 
+@pytest.fixture(scope="module", autouse=True)
+def process_group(tmp_path_factory):
+    if dist.is_initialized():
+        yield
+        return
+    rendezvous = tmp_path_factory.mktemp("optimizer-memory") / "rendezvous"
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
 def _backend(runtime, offload=None):
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = runtime
     backend._mesh = {"edp": object()}
+    backend._parameter_ownership = ParameterOwnership()
     backend.fsdp_config = FSDPConfig(cpu_offload=offload)
     return backend
 
@@ -69,11 +93,12 @@ def _engine(runtime, model, offload=None):
     engine = object.__new__(TorchTurboEngine)
     engine.model = model
     engine.backend = _backend(runtime, offload)
+    engine.backend._parallel_context = ParallelContext("cpu", sp_size=1, ep_size=1)
+    engine.backend._parameter_ownership.register(model, set())
     engine.backend.rank = 0
     engine.backend._world_mesh = object()
     engine.backend._optimizer_memory = None
-    parallel_context = {"ep": {"ep_rank": 0, "ep_size": 1}}
-    engine.backend.get_parallel_context = lambda: parallel_context
+    parallel_context = engine.backend.get_parallel_context()
     # Match training: checkpoint I/O is created before the optimizer exists.
     engine._checkpoint = CheckpointCoordinator(
         EngineConfig(), engine.backend.create_checkpoint_manager(),

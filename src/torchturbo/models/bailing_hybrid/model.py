@@ -68,7 +68,12 @@ class TurboBailingMoeV3ForCausalLM(TurboModel, BailingMoeV3ForCausalLM):
         # MLA layers dispatch through the registered turbo_ulysses interface;
         # KDA layers rewrite their forward instead.
         self.register_sp_attention_interface(sp_info)
-        self.patch_kda_forward(sp_group, sp_size, sp_rank)
+        from .attention import patch_kda_forward
+        from .modeling_bailing_moe_v3 import BailingMoeV3KimiDeltaAttention
+
+        for layer in self.model.layers:
+            if isinstance(layer.attention, BailingMoeV3KimiDeltaAttention):
+                patch_kda_forward(layer.attention, sp_group, sp_size, sp_rank)
 
     @classmethod
     def patch_kda_forward(cls, sp_group, sp_size, sp_rank):

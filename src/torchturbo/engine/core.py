@@ -47,7 +47,7 @@ class DPBlockDistributedSampler(DistributedSampler):
     ``dp_rank`` (e.g. an SP group) yield the identical sequence. The
     sampler only knows the dp info and the block size; the engine picks
     ``rank_block`` as ``ga * batch_size`` with ``tt_gbs`` (whole optimizer
-    steps) or ``sp_size`` (legacy full-world sweep).
+    steps), ``batch_size`` for native TP, or legacy ``sp_size`` otherwise.
     """
 
     def __init__(
@@ -464,13 +464,17 @@ class TorchTurboEngine:
         return model
 
     def _log_info(self) -> None:
-        self.config.parallel_plan = self.parallel_plan
+        if self.parallel_plan.tp_size == 1 and self.parallel_plan.etp_size == 1:
+            self.config.parallel_plan = self.parallel_plan
+        # TP checkpoint provenance and later model resolution use caller inputs.
+        # The summary still displays the current model's resolved parallel plan.
+        logged_config = {**vars(self.config), "parallel_plan": self.parallel_plan}
 
         logger.info_rank0("TorchTurbo engine summary:")
         logger.info_rank0(
             "EngineConfig:\n%s",
             json.dumps(
-                vars(self.config),
+                logged_config,
                 indent=2,
                 default=lambda value: (
                     {
@@ -731,10 +735,15 @@ class TorchTurboEngine:
         if self.config.parallel_plan is not None:
             engine_plan = self.config.parallel_plan
 
-            for attr in ["sp_size", "ep_size"]:
-                if hasattr(engine_plan, attr):
-                    val = getattr(engine_plan, attr)
-                    setattr(plan, attr, val)
+            plan.sp_size = engine_plan.sp_size
+            plan.ep_size = engine_plan.ep_size
+            plan.tp_size = engine_plan.tp_size
+            plan.etp_size = engine_plan.etp_size
+            model_tp = plan.tensor_parallel_plan
+            engine_tp = engine_plan.tensor_parallel_plan
+            model_tp.plan.update(engine_tp.plan)
+            if engine_tp.validator is not None:
+                model_tp.validator = engine_tp.validator
 
             if hasattr(engine_plan, "plan") and engine_plan.plan:
                 if not hasattr(plan, "plan") or plan.plan is None:
@@ -846,16 +855,9 @@ class TorchTurboEngine:
     # ------------------------------------------------------------------
 
     def get_dp_info(self) -> dict[str, Any]:
-        """Get data-parallel rank/size, accounting for sequence parallelism.
+        """Get logical data-parallel rank, size, and group.
 
-        When SP is active, ranks in the same SP group share the same data.
-        The effective DP size = world_size / sp_size.
-
-        Example::
-
-            sp_size = 2
-            info = engine.get_dp_info()
-            # world_size=8 → dp_size=4, ranks [0,1] share dp_rank=0
+        SP and TP ranks share samples, so data_dp_size = world_size / (SP * TP).
         """
         return self.backend.get_dp_info()
 
@@ -870,11 +872,12 @@ class TorchTurboEngine:
         seed: int = 0,
         **kwargs: Any,
     ) -> Any:
-        """Create a DataLoader with SP-aware distributed sampling.
+        """Create a DataLoader with logical data-parallel sampling.
 
-        All ranks in an SP group receive the same batches. With ``tt_gbs``
+        All SP and TP replicas of a data rank receive the same batches. With ``tt_gbs``
         set, ``drop_last`` drops only the tail that cannot fill one more
-        whole optimizer step.
+        whole optimizer step. Without ``tt_gbs``, ``drop_last`` drops incomplete
+        logical TP microbatches and the caller controls optimizer-step windows.
 
         Example::
 
@@ -893,14 +896,16 @@ class TorchTurboEngine:
         dp_info = self.get_dp_info()
         sp_info = self.get_sp_info()
 
-        # Block granularity: whole optimizer steps (ga * batch_size per
-        # rank) with tt_gbs, else the legacy full-world-sweep layout.
+        # Block granularity is one optimizer step with tt_gbs, one logical
+        # microbatch for native TP, or the legacy SP layout otherwise.
         gbs = self.config.gbs
         if gbs is not None:
             gradient_accumulation_steps = self._ga_from_gbs(
-                gbs, sp_info["sp_size"], dist.get_world_size()
+                gbs, dp_info["dp_size"]
             )
             rank_block = gradient_accumulation_steps * batch_size
+        elif self.get_tp_info()["tp_size"] > 1:
+            rank_block = batch_size
         else:
             rank_block = sp_info["sp_size"]
 
@@ -968,44 +973,43 @@ class TorchTurboEngine:
         """Get sequence-parallel rank, size and group."""
         return self.backend.get_sp_info()
 
+    def get_tp_info(self) -> dict[str, Any]:
+        """Get tensor-parallel rank, size and group."""
+        return self.backend.get_tp_info()
+
     @staticmethod
-    def _ga_from_gbs(gbs: int, sp_size: int, world_size: int) -> int:
-        """ga = gbs * sp_size / world_size (= gbs / dp_size). Single source of
-        truth shared by the training loop and the sampler block sizing so the
-        two cannot drift apart."""
-        if (gbs * sp_size) % world_size != 0:
+    def _ga_from_gbs(gbs: int, dp_size: int) -> int:
+        """Derive accumulation from global microbatches and logical data replicas."""
+        if gbs % dp_size != 0:
             raise ValueError(
-                f"tt_gbs({gbs}) * sp_size({sp_size}) must be divisible by "
-                f"world_size({world_size}); got remainder "
-                f"{(gbs * sp_size) % world_size}."
+                f"tt_gbs({gbs}) must be divisible by logical dp_size({dp_size})."
             )
-        return (gbs * sp_size) // world_size
+        return gbs // dp_size
 
     def resolve_gradient_accumulation_steps(self, framework_ga: int) -> int:
-        """Return the ``gradient_accumulation_steps`` for the training loop.
-
-        Two modes:
-        - ``tt_gbs`` set (``--tt_gbs``): derive ``ga = tt_gbs * sp_size /
-          world_size``.
-        - ``tt_gbs`` unset: fall back to ``framework_ga * sp_size``
-        """
-        sp_size = int(self.get_sp_info().get("sp_size", 1))
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        """Resolve global microbatches, native TP GA, or legacy SP accumulation."""
+        sp_size = int(self.get_sp_info()["sp_size"])
         gbs = self.config.gbs
         if gbs is not None:
             if framework_ga > 1:
                 raise ValueError(
                     f"Cannot set both tt_gbs ({gbs}) and "
-                    f"gradient_accumulation_steps ({framework_ga}) at the same "
-                    f"time; pick one — tt_gbs will derive ga from gbs*sp/world."
+                    f"gradient_accumulation_steps ({framework_ga}); "
+                    "tt_gbs derives accumulation from logical data DP."
                 )
-            ga = self._ga_from_gbs(gbs, sp_size, world_size)
+            dp_size = self.get_dp_info()["dp_size"]
+            ga = self._ga_from_gbs(gbs, dp_size)
             logger.info_rank0(
-                "gbs=%d, sp=%d: gradient_accumulation_steps = %d*%d/%d = %d "
-                "(overriding framework ga=%d)",
-                gbs, sp_size, gbs, sp_size, world_size, ga, framework_ga,
+                "gbs=%d, data_dp=%d: gradient_accumulation_steps=%d",
+                gbs, dp_size, ga,
             )
             return ga
+        if self.get_tp_info()["tp_size"] > 1:
+            logger.info_rank0(
+                "TP logical data_dp=%d: explicit gradient_accumulation_steps=%d",
+                self.get_dp_info()["dp_size"], framework_ga,
+            )
+            return framework_ga
         logger.info_rank0(
             "sp=%d: gradient_accumulation_steps %d -> %d (step compensated)",
             sp_size, framework_ga, framework_ga * sp_size,
@@ -1048,18 +1052,65 @@ class TorchTurboEngine:
         model: nn.Module,
         inputs: Any,
         return_outputs: bool = False,
-        num_items_in_batch: int | None = None,
+        num_items_in_batch: int | torch.Tensor | None = None,
         gradient_accumulation_steps: int = 1,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> Any:
         """Compute the scalar loss for a single micro-batch.
 
         Packed SFT batches contain one token row and validated cu/max metadata.
         Sequence boundaries reach the models only as ``cu_seq_lens_q/k``;
         batches carrying ``attention_mask`` are rejected.
         """
-        inputs = model.on_prepare_inputs(inputs)
-        inputs = self.backend.prepare_inputs(model, inputs)
+        inputs = self.prepare_loss_inputs(model, inputs)
+        return self.compute_prepared_loss(
+            model, inputs, return_outputs, num_items_in_batch,
+            gradient_accumulation_steps, **kwargs,
+        )
+
+    def prepare_loss_inputs(
+        self, model: nn.Module, inputs: Any,
+    ) -> dict[str, Any]:
+        """Prepare a source-device batch once before counting or forwarding."""
+        inputs = model.on_prepare_inputs(dict(inputs))
+        return dict(self.backend.prepare_inputs(model, inputs))
+
+    def prepare_loss_step(
+        self, model: nn.Module, batch_samples: list[dict[str, Any]],
+        device: torch.device,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Prepare TP SFT microbatches and count unique step targets.
+
+        This unique logical-data-DP count is for TP SFT only; legacy loss keeps
+        its historical WORLD/SP denominator. Hooks and padding run on each
+        source device. Only the count moves to the collective device.
+        """
+        if self.get_tp_info()["tp_size"] == 1:
+            raise ValueError("prepare_loss_step requires TP SFT (tp_size > 1)")
+        prepared = [self.prepare_loss_inputs(model, batch) for batch in batch_samples]
+        local_count = 0
+        for batch in prepared:
+            targets = self.backend.prepare_loss_targets(
+                batch["labels"], batch.get("cu_seq_lens_q")
+            )
+            local_count += int((targets != -100).sum())
+        count = torch.tensor(local_count, dtype=torch.int64, device=device)
+        dp_info = self.get_dp_info()
+        if dp_info["dp_size"] > 1:
+            dist.all_reduce(count, group=dp_info["dp_group"])
+        num_targets = int(count)
+        if num_targets == 0:
+            raise ValueError("Optimizer step has no valid targets")
+        return prepared, num_targets
+
+    def compute_prepared_loss(
+        self, model: nn.Module, inputs: dict[str, Any],
+        return_outputs: bool = False,
+        num_items_in_batch: int | torch.Tensor | None = None,
+        gradient_accumulation_steps: int = 1,
+        **kwargs: Any,
+    ) -> Any:
+        """Compute one prepared microbatch's objective and detached step report."""
         if model.training:
             self._record_micro(inputs)
         self._prepare_moe_runtime(
@@ -1231,10 +1282,18 @@ class TorchTurboEngine:
             Callable[[Any, dict[str, Any], float], torch.Tensor]
         ] = None,
     ) -> None:
-        """Run packed-token forward and optional backward over micro-batches."""
+        """Run packed-token policy losses and optional backward over micro-batches.
+
+        TP policy-loss execution is unsupported, including forward-only mode.
+        """
 
         if self.model is None:
             raise RuntimeError("Call engine.prepare_model() before forward_backward_batch().")
+        if self.get_tp_info()["tp_size"] > 1:
+            raise ValueError(
+                "forward_backward_batch() does not support packed RL policy losses "
+                "with TP>1, including forward_only=True."
+            )
 
         total_loss_weight = self._compute_total_loss_weight(mb_list, device)
         loss_multiplier = self._get_loss_multiplier()

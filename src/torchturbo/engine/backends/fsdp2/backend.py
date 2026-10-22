@@ -25,11 +25,20 @@ from torchturbo.models.modules.attention.ulysses import (
     ulysses_pad_inputs,
 )
 from torchturbo.models.modules.comm import all_gather_tensor
-from torchturbo.models.modules.loss import chunk_loss, logits_loss
+from torchturbo.models.modules.loss import (
+    chunk_loss,
+    logits_loss,
+    prepare_loss_targets,
+)
 from torchturbo.models.modules.vision import register_vision_balance
 from torchturbo.parallel import (
     FSDPPlanSpec,
     FSDPParallelPlan,
+)
+from torchturbo.engine.backends.fsdp2.parallel_context import (
+    ParallelContext,
+    ParameterOwnership,
+    validate_parallel_degrees,
 )
 from torchturbo.runtime import DeviceRuntime
 from torchturbo.engine.model_fqn import ModelFQNMap, build_model_fqn_map
@@ -39,7 +48,7 @@ from torchturbo.engine.optimizers import (
     OptimizerPlan,
     OptimizersContainer,
 )
-from torchturbo.engine.utils import match_fqn
+from torchturbo.utils.fqn import match_fqn
 from torchturbo.utils.torch_utils import torch_version
 
 from ...backend_registry import register_backend
@@ -52,6 +61,7 @@ from .config import CPUOffloadMode, FSDPConfig
 from .optimizers.adamw import prepare_fsdp_adamw_optimizer
 from .optimizers.memory import OptimizerMemoryController
 from .prefetch import FSDPPrefetchManager
+from .tp_gradient import clip_grad_norm_by_layout_, split_optimizer_groups_by_layout
 
 logger = get_logger(__name__)
 
@@ -78,6 +88,7 @@ class _FSDPUnit:
     modules: list[nn.Module]
     mesh: Any
     reshard_after_forward: bool | None = None
+    expert_parallel: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,159 +159,197 @@ class FSDP2Backend(BaseBackend):
             config=self.fsdp_config,
         )
 
-        # Sequence parallel process group and device mesh
         self.rank = dist.get_rank()
-        self._mesh: Any = None  # torch.distributed.device_mesh.DeviceMesh
+        self._parallel_context: ParallelContext | None = None
+        self._parameter_ownership = ParameterOwnership()
+        # Loader, saver, and FSDP unit construction retain these mesh aliases.
+        self._mesh: Any = None
         self._world_mesh: Any = None
-        self._sp_size: int = 1
-        self._sp_group: dist.ProcessGroup = None
-        self._sp_rank: int = 0
-
-        # Data parallel process group.
-        # exposed through :`get_dp_info`.
-        self._dp_group: dist.ProcessGroup = None
-        self._dp_rank: int = 0
-        self._dp_size: int = 1
         self.use_transformer_engine = False
         self.gradient_scaling_factor = 1.0
         self.parallel_plan: FSDPParallelPlan = None
         self._resolved_parallel_plan: _ResolvedFSDPPlan | None = None
 
-    def _create_sp_group(self, sp_size: int) -> dist.ProcessGroup | None:
-        """Create sequence parallel process group.
+    def _validate_tensor_parallel_features(
+        self,
+        model: nn.Module,
+        plan: FSDPParallelPlan,
+        peft_config: Any,
+    ) -> None:
+        """Admit backend features and the model on original/prepared trees.
 
-        Groups consecutive ranks into SP groups of size ``sp_size``.
-        E.g. with 8 GPUs and sp_size=4:
-          group 0: [0, 1, 2, 3]
-          group 1: [4, 5, 6, 7]
+        Original admission precedes mesh creation and replacement. Prepared
+        admission precedes router assignment and all native TP transformations.
         """
-        if not dist.is_initialized():
-            logger.warning_rank0(
-                "torch.distributed not initialized — skipping SP group creation. "
-                "SP groups will be created lazily when needed."
-            )
-            return None
-
-        world_size = dist.get_world_size()
-        rank = self.rank
-
-        if world_size % sp_size != 0:
-            raise ValueError(
-                f"World size ({world_size}) must be divisible by "
-                f"sp_size ({sp_size}) for sequence parallelism."
-            )
-
-        # Create all SP groups (all ranks must call this)
-        sp_group = None
-        for start in range(0, world_size, sp_size):
-            ranks = list(range(start, start + sp_size))
-            group = dist.new_group(ranks)
-            if rank in ranks:
-                sp_group = group
-        sp_rank = dist.get_rank(sp_group)
-
-        logger.info_rank0(
-            "Created SP process group: sp_size=%d, rank=%d, " "group_ranks=%s",
-            sp_size,
-            rank,
-            list(range((rank // sp_size) * sp_size, (rank // sp_size + 1) * sp_size)),
+        context = self._parallel_context
+        requested_tp = plan.tp_size != 1 or plan.etp_size != 1
+        initialized_tp = context is not None and (
+            context.tp_size != 1 or context.etp_size != 1
         )
-
-        self._sp_size = sp_size
-        self._sp_group = sp_group
-        self._sp_rank = sp_rank
-
-    def _create_dp_group(self) -> dist.ProcessGroup | None:
-        """Create data parallel process group for Ulysses SP.
-
-        E.g. ``world_size=16, sp_size=2`` -> mesh ``(8, 2)`` ::
-            r 0 -> (0,0)  dpg=[0,2,4,6,8,10,12,14]   spg=[0,1]
-            r 1 -> (0,1)  dpg=[1,3,5,7,9,11,13,15]   spg=[0,1]
-            r 2 -> (1,0)  dpg=[0,2,4,6,8,10,12,14]   spg=[2,3]
-        """
-        if not dist.is_initialized():
-            self.logger.warning(
-                "torch.distributed not initialized — skipping DP group creation."
+        if requested_tp and not dist.is_initialized():
+            raise ValueError("TP requires an initialized process group before preparation.")
+        if (requested_tp or initialized_tp) and context is not None:
+            requested = (plan.sp_size, plan.ep_size, plan.tp_size, plan.etp_size)
+            initialized = (
+                context.sp_size, context.ep_size, context.tp_size, context.etp_size
             )
-            return None
-
-        world_size = dist.get_world_size()
-        if self._sp_size <= 1:
-            self._dp_group = dist.group.WORLD
-            self._dp_rank = self.rank
-            self._dp_size = world_size
-            self.logger.debug("sp_size <= 1, _dp_group=%s", self._dp_group)
-            return self._dp_group
-
-        if world_size % self._sp_size != 0:
-            raise ValueError(
-                f"World size ({world_size}) must be divisible by "
-                f"sp_size ({self._sp_size}) for data parallelism under SP."
-            )
-
-        dp_size = world_size // self._sp_size
-
-        # DP (data) replication set for rank r = ranks sharing the same SP
-        # offset: [r%sp, r%sp+sp, r%sp+2*sp, ...] (a "column" of the
-        # (dp_size, sp_size) row-major layout). All ranks must call
-        # dist.new_group, exactly as in :meth:`_create_sp_group`.
-        dp_group = None
-        for j in range(self._sp_size):
-            ranks = list(range(j, world_size, self._sp_size))
-            group = dist.new_group(ranks)
-            if self.rank in ranks:
-                dp_group = group
-        self._dp_group = dp_group
-        self._dp_rank = dist.get_rank(group=dp_group)
-        self._dp_size = dp_size
-
-        self.logger.info(
-            "Created DP process group (via new_group, no extra mesh): "
-            "dp_size=%d, dp_rank=%d, sp=%d",
-            self._dp_size,
-            self._dp_rank,
-            self._sp_size,
+            if requested != initialized:
+                raise ValueError(
+                    f"TP requested degrees {requested} differ from initialized "
+                    f"parallel degrees {initialized}."
+                )
+        if not requested_tp:
+            return
+        validate_parallel_degrees(
+            dist.get_world_size(), sp_size=plan.sp_size, ep_size=plan.ep_size,
+            tp_size=plan.tp_size, etp_size=plan.etp_size,
         )
-        return self._dp_group
+        if torch_version() < (2, 10, 0):
+            raise ValueError("TP requires PyTorch >= 2.10.0.")
+        if peft_config is not None:
+            raise ValueError("TP does not support PEFT.")
+        if self.config.optimizer.name == MuonPlan.name:
+            raise ValueError("TP does not support Muon or QK clipping.")
+        if self.fsdp_config.cpu_offload.enabled:
+            raise ValueError("TP does not support CPU/optimizer offload.")
+        if self.config.mtp.enabled:
+            raise ValueError("TP does not support MTP or DSpark.")
+        if type(self.fsdp_config.reshard_after_forward) is not bool:
+            raise ValueError("TP requires boolean reshard_after_forward.")
+        from torchturbo.engine.tensor_parallel.expert import GroupedMLPParallel
 
-    def _init_mesh(self, plan: Any) -> Any | None:
-        """Create an N-dimensional DeviceMesh based on the parallel plan."""
-        if self._mesh is not None:
+        has_expert_style = any(
+            isinstance(style, GroupedMLPParallel)
+            for style in plan.tensor_parallel_plan.plan.values()
+        )
+        if has_expert_style:
+            if plan.tp_size != plan.etp_size or plan.etp_size <= 1:
+                raise ValueError("Routed TP requires aligned tp_size=etp_size>1.")
+        elif plan.etp_size != 1 or plan.ep_size != 1:
+            raise ValueError("Dense TP requires ep_size=etp_size=1; ETP needs the shared expert style.")
+        if not plan.tensor_parallel_plan.plan:
+            raise ValueError("TP requires a nonempty tensor_parallel_plan from the model.")
+        from ....models.base import TurboModel
+        from ....models.modules.moe.moe_layer import BaseMoELayer
+        from torchturbo.engine.tensor_parallel import (
+            PrepareModuleMetadata,
+            SharedHeadNormParallel,
+        )
+        from torch.distributed.tensor.parallel import SequenceParallel
+
+        if isinstance(model, TurboModel) and model.is_diffusion_model:
+            raise ValueError("TP does not support diffusion models.")
+        if model.config.__dict__.get("dspark_block_size") is not None:
+            raise ValueError("TP does not support DSpark.")
+        for module in model.modules():
+            if isinstance(module, BaseMoELayer) and not has_expert_style:
+                raise ValueError("TP with routed experts requires the aligned ETP style.")
+            if isinstance(module, nn.Dropout) and module.p:
+                raise ValueError("TP currently requires dropout=0.")
+        for name in (
+            "attention_dropout", "hidden_dropout", "hidden_dropout_prob",
+            "attention_probs_dropout_prob",
+        ):
+            if model.config.__dict__.get(name, 0):
+                raise ValueError(f"TP currently requires {name}=0 (dropout).")
+        for style in plan.tensor_parallel_plan.plan.values():
+            if isinstance(style, SequenceParallel) and not isinstance(
+                style, SharedHeadNormParallel
+            ):
+                raise ValueError("TP sequence-sharded activations are not supported.")
+        allowed_domains = (None, "dp", "edp") if has_expert_style else (None, "dp")
+        for spec in plan.plan.values():
+            if spec.no_shard:
+                raise ValueError("TP does not support no_shard without declared gradient semantics.")
+            if spec.vision_balance is not None and spec.vision_balance.mode is not None:
+                raise ValueError("TP does not support vision balance.")
+            if spec.placement is not None:
+                mesh_dim = spec.placement.mesh_dim
+                if isinstance(mesh_dim, int):
+                    raise ValueError("TP FSDP mesh_dim must use a named dense domain, not an integer.")
+                if mesh_dim == "world":
+                    raise ValueError("TP parameters cannot use explicit WORLD FSDP placement.")
+                if mesh_dim not in allowed_domains:
+                    raise ValueError("Dense TP does not support expert or computation FSDP domains.")
+
+        validator = plan.tensor_parallel_plan.validator
+        if validator is not None:
+            validator.validate(model, plan)
+        # Metadata validation also gates destructive model replacements.
+        for pattern, style in plan.tensor_parallel_plan.plan.items():
+            if isinstance(style, PrepareModuleMetadata):
+                for fqn, module in model.named_modules():
+                    if match_fqn(pattern, fqn):
+                        style.validate(module, plan.tp_size)
+
+    def _validate_expert_tensor_parallel(
+        self, model: nn.Module, resolved_tp: Mapping[str, Any]
+    ) -> None:
+        """Validate exact expert targets and their compiled FSDP ownership."""
+        from ....models.modules.moe.moe_layer import BaseMoELayer
+        from torchturbo.engine.tensor_parallel.expert import GroupedMLPParallel
+
+        expert_targets = {
+            fqn for fqn, style in resolved_tp.items() if isinstance(style, GroupedMLPParallel)
+        }
+        shared_targets = set()
+        for fqn, module in model.named_modules():
+            if isinstance(module, BaseMoELayer):
+                expert_fqn = f"{fqn}.experts" if fqn else "experts"
+                shared_targets.add(expert_fqn)
+                if expert_fqn not in expert_targets:
+                    raise ValueError(f"Routed TP requires GroupedMLPParallel on {expert_fqn!r}.")
+                spec = self._resolved_parallel_plan.modules.get(expert_fqn)
+                if spec is None or spec.placement is None or spec.placement.mesh_dim != "edp":
+                    raise ValueError(f"ETP requires an edp FSDP unit on {expert_fqn!r}.")
+                num_shards = self._parallel_context.expert_fsdp_mesh.size()
+                if module.num_local_experts < num_shards:
+                    logger.info_rank0(
+                        "%s has %d local experts across %d FSDP ranks; some expert shards are empty.",
+                        expert_fqn, module.num_local_experts, num_shards,
+                    )
+        if expert_targets != shared_targets:
+            raise ValueError("ETP styles must target shared MoELayer.experts modules.")
+        for fqn, spec in self._resolved_parallel_plan.modules.items():
+            if (
+                spec.placement is not None
+                and spec.placement.mesh_dim == "edp"
+                and fqn not in expert_targets
+            ):
+                raise ValueError(f"ETP edp domain is reserved for shared experts, got {fqn!r}.")
+        for fqn, spec in self._resolved_parallel_plan.parameters.items():
+            if spec.placement is not None and spec.placement.mesh_dim == "edp":
+                if fqn.rpartition(".")[0] not in expert_targets:
+                    raise ValueError(f"ETP edp domain is reserved for shared experts, got {fqn!r}.")
+
+    def _prepare_expert_tensor_parallel(self, model: nn.Module) -> None:
+        """Assign shared MoE runtime only after complete prepared admission."""
+        from ....models.modules.moe.moe_layer import BaseMoELayer
+
+        for module in model.modules():
+            if isinstance(module, BaseMoELayer):
+                module.router.sp_group = self._parallel_context.sp_mesh.get_group()
+                module.router.routing_group = self._parallel_context.etp_mesh.get_group()
+                module.config.moe_aux_loss_coeff = self.config.moe.aux_loss_coeff
+                module.config.moe_z_loss_coeff = self.config.moe.z_loss_coeff
+
+    def _init_mesh(self, plan: FSDPParallelPlan) -> Any | None:
+        """Create the shared topology and legacy mesh aliases."""
+        if self._parallel_context is not None:
             return self._mesh
-
         if not dist.is_initialized():
             return None
-
-        try:
-            from torch.distributed.device_mesh import init_device_mesh
-        except ImportError:
-            raise ValueError("torch.distributed.device_mesh not available.")
-
-        world_size = dist.get_world_size()
-
-        ep_size = getattr(plan, "ep_size", 1)
-        sp_size = getattr(plan, "sp_size", 1)
-        if world_size % sp_size != 0:
-            raise ValueError(
-                f"World size ({world_size}) must be divisible by "
-                f"sp_size ({sp_size}) for sequence parallelism."
-            )
-
-        world_size = world_size
-        device_name = self.device.type
-        self._world_mesh = init_device_mesh(
-            device_name,
-            (world_size,),
-            mesh_dim_names=("dp",),
+        self._parallel_context = ParallelContext(
+            self.device.type,
+            sp_size=plan.sp_size,
+            ep_size=plan.ep_size,
+            tp_size=plan.tp_size,
+            etp_size=plan.etp_size,
         )
-        self._mesh = init_device_mesh(
-            device_name, (world_size // ep_size, ep_size), mesh_dim_names=("edp", "ep")
-        )
-
+        self._world_mesh = self._parallel_context.dense_fsdp_mesh
+        self._mesh = self._parallel_context.expert_mesh
         logger.info_rank0("Created DeviceMesh")
-
-        self._create_sp_group(sp_size)
-        self._create_dp_group()
+        return self._mesh
 
     def _replace_modules(self, model: nn.Module, plan: FSDPParallelPlan) -> nn.Module:
         """Replace modules according to the parallel plan (e.g., MoE layers).
@@ -335,6 +384,8 @@ class FSDP2Backend(BaseBackend):
                     kwargs["ep_info"] = self.get_ep_info()
                     kwargs["sp_info"] = self.get_sp_info()
                     kwargs["engine_config"] = self.config
+                    if plan.tp_size > 1:
+                        kwargs["parallel_context"] = self.get_parallel_context()
                     new_module = spec.replace_module(submodule, **kwargs)
 
                     if new_module is not None and new_module is not submodule:
@@ -445,6 +496,7 @@ class FSDP2Backend(BaseBackend):
         else:
             plan = parallel_plan
 
+        self._validate_tensor_parallel_features(model, plan, peft_config)
         self.parallel_plan = plan
 
         # Initialize DeviceMesh and SP groups
@@ -460,6 +512,48 @@ class FSDP2Backend(BaseBackend):
             logger.info_rank0("Applying PEFT LoRA to model")
             model = apply_peft(model, peft_config)
 
+        # Freeze model-authored patterns into exact targets before later
+        # transformations can add wrappers or replace parameter objects.
+        self._model_fqn_map = build_model_fqn_map(model)
+        self._resolved_parallel_plan = self._compile_parallel_plan(
+            plan, self._model_fqn_map
+        )
+
+        if plan.tp_size > 1:
+            from torchturbo.engine.tensor_parallel.parallelize import (
+                apply_tensor_parallel_plan,
+                resolve_tensor_parallel_plan,
+                validate_tensor_parallel_targets,
+            )
+
+            context = self._parallel_context
+            resolved_tp = resolve_tensor_parallel_plan(
+                plan.tensor_parallel_plan.plan, self._model_fqn_map
+            )
+            self._validate_tensor_parallel_features(model, plan, peft_config)
+            self._validate_expert_tensor_parallel(model, resolved_tp)
+            validate_tensor_parallel_targets(
+                model, resolved_tp, tp_mesh=context.tp_mesh, etp_mesh=context.etp_mesh
+            )
+            # Vocabulary stays complete on each TP lane in the first version.
+            from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
+
+            vocabulary_modules = {model.get_lm_head()}
+            get_input_embeddings = model.get_input_embeddings
+            try:
+                vocabulary_modules.add(get_input_embeddings())
+            except NotImplementedError:
+                pass
+            for fqn, style in resolved_tp.items():
+                if model.get_submodule(fqn) in vocabulary_modules and isinstance(
+                    style, (ColwiseParallel, RowwiseParallel)
+                ):
+                    raise ValueError("TP vocabulary sharding is not supported.")
+            self._prepare_expert_tensor_parallel(model)
+            model = apply_tensor_parallel_plan(
+                model, resolved_tp, tp_mesh=context.tp_mesh, etp_mesh=context.etp_mesh
+            )
+
         # Models slice inputs at their declared boundary. Install slicing
         # first so activation checkpointing wraps it and remains effective.
         sp_info = self.get_sp_info()
@@ -471,13 +565,6 @@ class FSDP2Backend(BaseBackend):
                 sp_info["sp_rank"],
             )
 
-        # Freeze model-authored patterns into exact targets before later
-        # transformations can add wrappers or replace parameter objects.
-        self._model_fqn_map = build_model_fqn_map(model)
-        self._resolved_parallel_plan = self._compile_parallel_plan(
-            plan, self._model_fqn_map
-        )
-
         # Phase 3: Activation checkpointing must be applied before FSDP2 so
         # checkpoint recompute runs inside the FSDP unit, not around it. Targets
         # are explicit in the parallel plan and patch module.forward directly, so
@@ -487,7 +574,12 @@ class FSDP2Backend(BaseBackend):
         )
 
         # Phase 4: FSDP2 sharding.
-        model = self._shard_model(model, self._resolved_parallel_plan)
+        if plan.tp_size > 1:
+            model = self._shard_model(
+                model, self._resolved_parallel_plan, tensor_parallel=True
+            )
+        else:
+            model = self._shard_model(model, self._resolved_parallel_plan)
         self.prefetch_manager.setup(model)
 
         # Append after FSDP hooks so unsharding and mixed-precision casting run
@@ -509,7 +601,9 @@ class FSDP2Backend(BaseBackend):
             )
 
         ep_size = self.get_ep_info()["ep_size"]
-        if ep_size > 1:
+        if plan.tp_size > 1:
+            self.gradient_scaling_factor = 1.0
+        elif ep_size > 1:
             self.gradient_scaling_factor = 1 / ep_size
 
         return model
@@ -522,9 +616,8 @@ class FSDP2Backend(BaseBackend):
         offload = self.fsdp_config.cpu_offload
         return FSDP2CheckpointManager(
             rank=self.rank,
-            mesh=self._mesh,
-            world_mesh=self._world_mesh,
-            parallel_context=self.get_parallel_context(),
+            parallel_context=self._parallel_context,
+            ownership=self._parameter_ownership,
             device_runtime=self.device_runtime,
             cpu_offload=offload.enabled and offload.mode is CPUOffloadMode.FULL,
             # The manager is created before prepare_optimizer().
@@ -570,6 +663,7 @@ class FSDP2Backend(BaseBackend):
     def finalize_model_load(self, model: nn.Module) -> nn.Module:
         # Register after loading or materialization because assign=True can
         # replace parameter objects and discard hooks registered earlier.
+        self._parameter_ownership.bind(model)
         self._register_no_shard_params_grad_sync(model)
         return model
 
@@ -619,6 +713,8 @@ class FSDP2Backend(BaseBackend):
                 unit_by_module_id[id(module)] = (idx, unit)
 
         applied: set[int] = set()
+        owned_parameters: set[nn.Parameter] = set()
+        expert_parameters: set[nn.Parameter] = set()
 
         for _, module in reversed(list(model.named_modules())):
             item = unit_by_module_id.get(id(module))
@@ -636,6 +732,23 @@ class FSDP2Backend(BaseBackend):
                 )
 
             fully_shard(unit.modules, mesh=unit.mesh, **target_fsdp_kwargs)
+            if (
+                unit.expert_parallel
+                and self._parallel_context is not None
+                and self._parallel_context.tp_size > 1
+            ):
+                self._configure_expert_gradient_divisor(unit, target_fsdp_kwargs)
+            # Earlier child units already own their DTensors. Ignored
+            # parameters never acquire an FSDP owner.
+            sharded_parameters = {
+                parameter
+                for root in unit.modules
+                for parameter in root.parameters()
+                if isinstance(parameter, DTensor)
+            }
+            if unit.expert_parallel:
+                expert_parameters.update(sharded_parameters - owned_parameters)
+            owned_parameters.update(sharded_parameters)
             applied.add(unit_idx)
 
         if len(applied) != len(units):
@@ -643,11 +756,54 @@ class FSDP2Backend(BaseBackend):
                 "Some FSDP units were not found in model.named_modules(); "
                 "FSDP units must only contain registered model submodules."
             )
+        self._parameter_ownership.register(model, expert_parameters)
+
+    def _configure_expert_gradient_divisor(
+        self, unit: _FSDPUnit, fsdp_kwargs: dict[str, Any]
+    ) -> None:
+        # Aligned TP=ETP combines K independent dense-lane contributions via EP/EDP.
+        # Dividing by dense K pairs with the backward multiplier K/N_step.
+        divisor = self._parallel_context.dense_fsdp_mesh.size()
+        num_shards = unit.mesh.size()
+        policy = fsdp_kwargs.get("mp_policy")
+        reduction_dtype = None
+        if policy is not None:
+            reduction_dtype = policy.reduce_dtype or policy.param_dtype
+        reduction_dtypes = {
+            reduction_dtype or parameter.dtype
+            for module in unit.modules
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        }
+        if (
+            num_shards == 1
+            and divisor > 1
+            and reduction_dtypes & {torch.float16, torch.float64}
+        ):
+            raise ValueError(
+                "ETP with a size-one FSDP mesh and custom divisor K>1 does not "
+                "support float16/float64 effective gradient reduction. Select "
+                "FP32/BF16 effective reduction or a larger expert FSDP mesh."
+            )
+        anchor = unit.modules[0]
+        anchor.set_gradient_divide_factor(divisor)
+        if (
+            unit.mesh.device_type == "cpu"
+            and dist.get_backend(unit.mesh.get_group()) == "gloo"
+            and num_shards > 1
+            and divisor > num_shards
+            and reduction_dtypes & {torch.float32, torch.bfloat16}
+        ):
+            # Gloo cannot execute the default custom-divisor PREMUL_SUM.
+            # Size-one units must retain the default path to avoid /K twice.
+            anchor.set_force_sum_reduction_for_comms(True)
 
     def _optimize_fsdp_units(
         self,
         model: nn.Module,
         units: list[_FSDPUnit],
+        *,
+        tensor_parallel: bool = False,
     ) -> list[_FSDPUnit]:
         """Return optimized FSDP units before ``fully_shard``.
 
@@ -741,6 +897,42 @@ class FSDP2Backend(BaseBackend):
             if isinstance(tail_embed, nn.Module)
             else None
         )
+        if tensor_parallel and is_tied:
+            # Child units are applied first and own their subtrees before a
+            # containing parent. Resolve that owner rather than only anchors.
+            unit_by_owned_module_id: dict[int, _FSDPUnit] = {}
+            for _, module in reversed(list(model.named_modules())):
+                unit = unit_by_module_id.get(id(module))
+                if unit is None:
+                    continue
+                for root in unit.modules:
+                    for child in root.modules():
+                        unit_by_owned_module_id.setdefault(id(child), unit)
+            tail_embed_unit = unit_by_owned_module_id.get(id(input_embed))
+            output_unit = unit_by_owned_module_id.get(id(output_embed))
+            if tail_embed_unit is None:
+                tail_embed_unit = output_unit
+            elif output_unit is not None and output_unit is not tail_embed_unit:
+                if tail_embed_unit.mesh != output_unit.mesh:
+                    raise ValueError("TP tied embedding/head must share an FSDP domain.")
+                merged_modules = tail_embed_unit.modules + output_unit.modules
+                # A fully_shard module list must not include a root together
+                # with its descendant when the two owners are nested.
+                nested_module_ids = {
+                    id(child)
+                    for root in merged_modules
+                    for child in root.modules()
+                    if child is not root
+                }
+                tail_embed_unit.modules = [
+                    root for root in merged_modules
+                    if id(root) not in nested_module_ids
+                ]
+                optimized.remove(output_unit)
+            if tail_embed_unit is not None:
+                for embedding in (input_embed, output_embed):
+                    if id(embedding) not in unit_by_owned_module_id:
+                        tail_embed_unit.modules.append(embedding)
         if tail_embed_unit is not None:
             if merge_norm_with_tail and can_add_auto_unit(final_norm):
                 tail_embed_unit.modules = [final_norm] + tail_embed_unit.modules
@@ -751,6 +943,7 @@ class FSDP2Backend(BaseBackend):
                 for module in (
                     (final_norm if merge_norm_with_tail else None),
                     tail_embed,
+                    output_embed if tensor_parallel and is_tied else None,
                 )
                 if can_add_auto_unit(module)
             ]
@@ -798,8 +991,9 @@ class FSDP2Backend(BaseBackend):
     def _apply_activation_checkpointing(
         self, model: nn.Module, plan: _ResolvedFSDPPlan
     ) -> nn.Module:
-        from contextlib import nullcontext
+        from contextlib import contextmanager, nullcontext
         from torch.utils.checkpoint import checkpoint
+        from ....models.modules.moe.moe_utils import suppress_router_statistics
 
         target_modules: list[tuple[str, nn.Module]] = []
         for fqn, submodule in model.named_modules():
@@ -833,6 +1027,18 @@ class FSDP2Backend(BaseBackend):
             if config is not None and hasattr(config, "use_cache"):
                 config.use_cache = False
 
+        @contextmanager
+        def recompute_context():
+            context = self._parallel_context
+            statistics_context = (
+                suppress_router_statistics()
+                if context is not None and context.tp_size > 1
+                else nullcontext()
+            )
+            with self.prefetch_manager.suspend_expert_forward_prefetch(model):
+                with statistics_context:
+                    yield
+
         def checkpoint_context_fn():
             # The recompute context is active only in backward. Expert containers
             # can be nested FSDP units under the checkpointed layer, and their
@@ -841,7 +1047,7 @@ class FSDP2Backend(BaseBackend):
             # edges can leak into backward.
             return (
                 nullcontext(),
-                self.prefetch_manager.suspend_expert_forward_prefetch(model),
+                recompute_context(),
             )
 
         def make_checkpointed_forward(module: nn.Module):
@@ -1106,7 +1312,13 @@ class FSDP2Backend(BaseBackend):
             raise TypeError("lm_head weight must be a tensor")
         return weight, prepared_reference, loss_anchor
 
-    def _shard_model(self, model: nn.Module, plan: _ResolvedFSDPPlan) -> nn.Module:
+    def _shard_model(
+        self,
+        model: nn.Module,
+        plan: _ResolvedFSDPPlan,
+        *,
+        tensor_parallel: bool = False,
+    ) -> nn.Module:
         named_modules = list(model.named_modules())
 
         # no_shard identification is shared with _register_no_shard_params_grad_sync
@@ -1139,6 +1351,7 @@ class FSDP2Backend(BaseBackend):
             modules: nn.Module | list[nn.Module],
             mesh: Any,
             reshard_after_forward: bool | None = None,
+            expert_parallel: bool = False,
         ) -> None:
             modules = modules if isinstance(modules, list) else [modules]
             unit_ids = {id(module) for module in modules}
@@ -1149,6 +1362,7 @@ class FSDP2Backend(BaseBackend):
                     modules=modules,
                     mesh=mesh,
                     reshard_after_forward=reshard_after_forward,
+                    expert_parallel=expert_parallel,
                 )
             )
             wrapped_modules.update(unit_ids)
@@ -1172,19 +1386,25 @@ class FSDP2Backend(BaseBackend):
             if spec.placement is None and not spec.standalone_world_shard:
                 continue
 
+            expert_parallel = False
             if spec.placement is not None:
                 mesh_dim = spec.placement.mesh_dim
-                if mesh_dim is None or mesh_dim == "world":
+                if mesh_dim is None or mesh_dim in ("world", "dp"):
                     target_mesh = self._world_mesh
                 else:
                     target_mesh = self._mesh[mesh_dim]
+                    expert_parallel = mesh_dim == "edp"
             else:
                 target_mesh = self._world_mesh
 
             explicit_subtree_modules.update(
                 id(child) for child in submodule.modules()
             )
-            _add_unit(submodule, target_mesh)
+            _add_unit(
+                submodule,
+                target_mesh,
+                expert_parallel=expert_parallel,
+            )
 
         # Default policy: each ModuleList child is a world-mesh FSDP unit.
         # Iterate reversed: named_modules() is a pre-order DFS (ancestors before
@@ -1206,7 +1426,9 @@ class FSDP2Backend(BaseBackend):
                     continue
                 _add_unit(child, self._world_mesh)
 
-        units = self._optimize_fsdp_units(model, units)
+        units = self._optimize_fsdp_units(
+            model, units, tensor_parallel=tensor_parallel
+        )
         self._apply_fsdp(model=model, units=units, fsdp_kwargs=fsdp_kwargs)
 
         return model
@@ -1236,64 +1458,53 @@ class FSDP2Backend(BaseBackend):
         return final_norm
 
     def get_dp_info(self) -> dict[str, Any]:
-        """Compute data-parallel rank and size, accounting for SP.
-
-        When SP is active, ranks in the same SP group process the same
-        data. The effective DP size = world_size / sp_size.
-
-        Returns ``{"dp_rank": ..., "dp_size": ..., "dp_group": ...}``.
-        """
+        """Return data-parallel rank, size, and group, accounting for SP."""
         if not dist.is_initialized():
             raise ValueError("Distributed not initialized")
-
-        return {
-            "dp_rank": self._dp_rank,
-            "dp_size": self._dp_size,
-            "dp_group": self._dp_group,
-        }
+        if self._parallel_context is None:
+            return {"dp_rank": 0, "dp_size": 1, "dp_group": None}
+        return self._parallel_context.get_dp_info()
 
     def get_sp_info(self) -> dict[str, Any]:
-        """Get sequence-parallel rank, size and group.
-
-        Returns ``{"sp_size": ..., "sp_group": ...}``.
-        """
+        """Return sequence-parallel rank, size, and group."""
         if not dist.is_initialized():
             raise ValueError("Distributed not initialized")
-
-        if self._sp_size and self._sp_group:
-            return {
-                "sp_size": self._sp_size,
-                "sp_group": self._sp_group,
-                "sp_rank": self._sp_rank,
-            }
-        else:
-            return {"sp_size": 1, "sp_group": None, "sp_rank": 0}
+        if self._parallel_context is None:
+            return {"sp_rank": 0, "sp_size": 1, "sp_group": None}
+        return self._parallel_context.get_sp_info()
 
     def get_ep_info(self) -> dict[str, Any]:
-        """Get expert-parallel rank, size and group.
-
-        Returns ``{"ep_rank": ..., "ep_size": ..., "ep_group": ...}``.
-        """
+        """Return expert-parallel rank, size, and group."""
         if not dist.is_initialized():
             raise ValueError("Distributed not initialized")
-
-        # If DeviceMesh is initialized, extract EP dimension directly
-        if self._mesh is not None and "ep" in self._mesh.mesh_dim_names:
-            ep_mesh = self._mesh["ep"]
-            return {
-                "ep_rank": ep_mesh.get_local_rank(),
-                "ep_size": ep_mesh.size(),
-                "ep_group": ep_mesh.get_group(),
-            }
-        else:
+        if self._parallel_context is None:
             return {"ep_rank": 0, "ep_size": 1, "ep_group": None}
+        return self._parallel_context.get_ep_info()
+
+    def get_tp_info(self) -> dict[str, Any]:
+        """Return tensor-parallel rank, size, and group."""
+        if not dist.is_initialized():
+            raise ValueError("Distributed not initialized")
+        if self._parallel_context is None:
+            return {"tp_rank": 0, "tp_size": 1, "tp_group": None}
+        return self._parallel_context.get_tp_info()
+
+    def get_etp_info(self) -> dict[str, Any]:
+        """Return expert tensor-parallel rank, size, and group."""
+        if not dist.is_initialized():
+            raise ValueError("Distributed not initialized")
+        if self._parallel_context is None:
+            return {"etp_rank": 0, "etp_size": 1, "etp_group": None}
+        return self._parallel_context.get_etp_info()
 
     def get_parallel_context(self) -> dict[str, Any]:
-        """Assemble the parallel-context dict from this backend's own EP/SP/DP info."""
+        """Assemble the parallel-context dictionary from the shared topology."""
         return {
             "dp": self.get_dp_info(),
             "sp": self.get_sp_info(),
             "ep": self.get_ep_info(),
+            "tp": self.get_tp_info(),
+            "etp": self.get_etp_info(),
         }
 
     def prepare_optimizer(
@@ -1303,6 +1514,16 @@ class FSDP2Backend(BaseBackend):
         """Build and validate the complete optimizer, including plan-defined hooks."""
         if not isinstance(plan, OptimizerPlan):
             raise TypeError("plan must be an OptimizerPlan")
+
+        context = self._parallel_context
+        tensor_parallel = context is not None and (
+            context.tp_size > 1 or context.etp_size > 1
+        )
+        if tensor_parallel and (
+            not isinstance(plan, OptimizerClassPlan)
+            or plan.optimizer_cls is not torch.optim.AdamW
+        ):
+            raise ValueError("TP currently supports only an AdamW OptimizerClassPlan.")
 
         if isinstance(plan, OptimizerClassPlan):
             groups_by_optimizer_name = plan.get_param_groups_by_optimizer_name()
@@ -1371,7 +1592,7 @@ class FSDP2Backend(BaseBackend):
             qk_clip_controller = install_qk_clip(
                 plan.qk_clip_plan,
                 optimizer,
-                sp_size=self._sp_size,
+                sp_size=self.get_sp_info()["sp_size"],
                 device=self.device,
             )
         self._optimizer_memory = OptimizerMemoryController(
@@ -1394,8 +1615,13 @@ class FSDP2Backend(BaseBackend):
         param_groups: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
         """Split native optimizer groups by FSDP mesh topology."""
+        context = self._parallel_context
+        if context is not None and (context.tp_size > 1 or context.etp_size > 1):
+            return split_optimizer_groups_by_layout(
+                param_groups, self._parameter_ownership
+            )
+
         optimizer_params = []
-        edp = self._mesh["edp"]
         for param_group in param_groups:
             group_options = {
                 key: value
@@ -1411,7 +1637,7 @@ class FSDP2Backend(BaseBackend):
                 if not param.requires_grad:
                     continue
                 if isinstance(param, DTensor):
-                    if param.device_mesh == edp:
+                    if self._parameter_ownership.is_expert(param):
                         key = "moe"
                     else:
                         key = "dense"
@@ -1525,6 +1751,15 @@ class FSDP2Backend(BaseBackend):
 
     @torch.no_grad()
     def clip_grad_norm_(self, parameters, max_norm=1.0, norm_type=2.0):
+        context = self._parallel_context
+        if context is not None and (context.tp_size > 1 or context.etp_size > 1):
+            return clip_grad_norm_by_layout_(
+                parameters, max_norm, norm_type,
+                ownership=self._parameter_ownership,
+                ep_group=context.ep_mesh.get_group(),
+                device=self.device,
+            )
+
         offload = self.fsdp_config.cpu_offload
         params = []
         grads = []
@@ -1534,13 +1769,12 @@ class FSDP2Backend(BaseBackend):
         # not DTensors; they must be handled separately to avoid mixed-type errors.
         ignored_params = []
         ignored_grads = []
-        edp = self._mesh["edp"] if self._mesh is not None else None
 
         for param in parameters:
             # Skip parameters without gradients to ensure correctness.
             if param.grad is not None:
-                if hasattr(param, "device_mesh"):
-                    if edp is not None and param.device_mesh == edp:
+                if isinstance(param, DTensor):
+                    if self._parameter_ownership.is_expert(param):
                         moe_params.append(param)
                         moe_grads.append(param.grad)
                     else:
@@ -1620,7 +1854,14 @@ class FSDP2Backend(BaseBackend):
             inputs, model.get_sequence_parallel_input_slicing_spec(), sp_size
         )
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    def compute_loss(
+        self, model: nn.Module, inputs: Any, return_outputs: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        inputs = dict(inputs)
+        tp_size = self.get_tp_info()["tp_size"]
+        if tp_size > 1:
+            self._validate_tp_loss_count(kwargs.get("num_items_in_batch"))
         if (
             inputs.get("position_ids", None) is None
             and inputs.get("mm_token_type_ids") is None
@@ -1642,11 +1883,6 @@ class FSDP2Backend(BaseBackend):
         sp_group = self.get_sp_info()["sp_group"]
         sp_rank = self.get_sp_info()["sp_rank"]
 
-        # assert num_items_in_batch is not None, "'num_items_in_batch' should not be None"
-
-        # # Repeated calculation in SP group
-        # num_items_in_batch = num_items_in_batch // sp_size
-
         use_chunked_loss = self.config.loss_chunk.enabled and model.training
         mtp_loss_scale = self.config.mtp.loss_scaling_factor
         outputs, chunk_hidden_states = self._forward_for_lm_loss(
@@ -1655,6 +1891,8 @@ class FSDP2Backend(BaseBackend):
             use_chunked_loss=use_chunked_loss,
         )
         dspark_loss_fn = getattr(outputs, "dspark_loss_fn", None)
+        if tp_size > 1 and dspark_loss_fn is not None:
+            raise ValueError("TP does not support DSpark loss outputs.")
 
         total_loss, component_losses = self._compute_lm_loss_with_sp(
             model=model,
@@ -1711,12 +1949,35 @@ class FSDP2Backend(BaseBackend):
 
         outputs.loss = total_loss
         outputs.main_loss = component_losses[0].detach()
+        if tp_size > 1:
+            dense_mesh = self._parallel_context.dense_fsdp_mesh
+            outputs.main_loss = outputs.main_loss.clone() / dense_mesh.size()
+            dist.all_reduce(outputs.main_loss, group=dense_mesh.get_group())
         if mtp_losses:
             outputs.mtp_loss = [loss.detach() for loss in mtp_losses]
             outputs.mtp_loss_scaled = (
                 sum(mtp_losses) * mtp_loss_scale
             ).detach()
         return (total_loss, outputs) if return_outputs else total_loss
+
+    @staticmethod
+    def _validate_tp_loss_count(count: int | torch.Tensor | None) -> None:
+        if count is None:
+            raise ValueError("TP SFT loss requires an exact step-level valid target count")
+        if torch.is_tensor(count) and count.numel() != 1:
+            raise ValueError("num_items_in_batch must be a scalar target count")
+        if count <= 0:
+            raise ValueError("num_items_in_batch must be positive")
+
+    @staticmethod
+    def prepare_loss_targets(
+        labels: torch.Tensor,
+        cu_seq_lens: torch.Tensor | None = None,
+        shift: int = 1,
+        ignore_index: int = -100,
+    ) -> torch.Tensor:
+        """Build full-row targets with causal shift and packed boundary masking."""
+        return prepare_loss_targets(labels, cu_seq_lens, shift, ignore_index)
 
     @staticmethod
     def _prepare_loss_labels(
@@ -1729,17 +1990,20 @@ class FSDP2Backend(BaseBackend):
         num_items_in_batch: int | torch.Tensor | None,
         cu_seq_lens: torch.Tensor | None = None,
         ignore_index: int = -100,
+        dense_size: int | None = None,
     ) -> tuple[list[torch.Tensor], list[float | torch.Tensor]]:
         """Build shifted labels and normalizers for each LM prediction stream.
 
-        When supplied, ``num_items_in_batch`` must be a positive global count of
-        valid tokens. This is a caller precondition, not a value checked here
-        for device tensors: a zero value can produce a zero denominator and a
-        NaN loss. Device tensors remain on device to avoid a synchronizing branch.
+        TP uses the exact positive optimizer-step target count divided by the
+        dense FSDP domain size. Legacy loss preserves its WORLD/SP arithmetic;
+        positive legacy device counts remain a caller precondition.
         """
         use_num_items = num_items_in_batch is not None
         num_items_normalizer: float | torch.Tensor | None = None
-        if use_num_items:
+        if dense_size is not None:
+            FSDP2Backend._validate_tp_loss_count(num_items_in_batch)
+            num_items_normalizer = num_items_in_batch / dense_size
+        elif use_num_items:
             world_size = dist.get_world_size()
             if torch.is_tensor(num_items_in_batch):
                 if num_items_in_batch.numel() != 1:
@@ -1774,28 +2038,13 @@ class FSDP2Backend(BaseBackend):
                     float(num_items_local * sp_size) / float(world_size)
                 )
 
-        sequence_ends = None
-        if cu_seq_lens is not None:
-            token_positions = torch.arange(labels.size(-1), device=labels.device)
-            # Segment index per token; padding beyond the last boundary clamps
-            # to it, and its positions always cross that boundary once shifted.
-            segment_index = torch.bucketize(
-                token_positions, cu_seq_lens[1:], right=True
-            ).clamp(max=cu_seq_lens.numel() - 2)
-            sequence_ends = cu_seq_lens[segment_index + 1]
-
         shifted_labels: list[torch.Tensor] = []
         normalizers: list[float | torch.Tensor] = []
         for shift_extra, prediction in enumerate(predictions):
             shift = 1 + shift_extra
-            labels_i = nn.functional.pad(
-                labels, (0, shift), value=ignore_index
+            labels_i = FSDP2Backend.prepare_loss_targets(
+                labels, cu_seq_lens, shift, ignore_index
             )
-            labels_i = labels_i[..., shift:].contiguous()
-            if sequence_ends is not None:
-                # Every prediction stream must target a token in its own sample.
-                crosses_boundary = token_positions + shift >= sequence_ends
-                labels_i.masked_fill_(crosses_boundary, ignore_index)
             # Count before SP slicing because the denominator covers the full
             # sequence. A fully masked stream uses one as a neutral denominator.
             label_num = (
@@ -1836,6 +2085,10 @@ class FSDP2Backend(BaseBackend):
         Returns the scaled total plus ``1 + num_mtp`` detached per-stream
         losses, main path first.
         """
+        tp_size = self.get_tp_info()["tp_size"]
+        dense_size = (
+            self._parallel_context.dense_fsdp_mesh.size() if tp_size > 1 else None
+        )
         if chunk_hidden_states is not None:
             hidden_states = chunk_hidden_states
 
@@ -1847,6 +2100,7 @@ class FSDP2Backend(BaseBackend):
                 sp_rank=sp_rank,
                 num_items_in_batch=num_items_in_batch,
                 cu_seq_lens=cu_seq_lens,
+                dense_size=dense_size,
             )
             loss_scales = [1.0] + [mtp_loss_scale] * (len(hidden_states) - 1)
             (
@@ -1885,6 +2139,7 @@ class FSDP2Backend(BaseBackend):
                 sp_rank=sp_rank,
                 num_items_in_batch=num_items_in_batch,
                 cu_seq_lens=cu_seq_lens,
+                dense_size=dense_size,
             )
             loss_scales = [1.0] + [mtp_loss_scale] * (len(logits) - 1)
             total_loss, component_losses = logits_loss(
@@ -1894,7 +2149,7 @@ class FSDP2Backend(BaseBackend):
                 loss_scales=loss_scales,
             )
 
-        if sp_size > 1 and sp_group is not None:
+        if tp_size == 1 and sp_size > 1 and sp_group is not None:
             total_loss = torch.distributed.nn.all_reduce(
                 total_loss, op=dist.ReduceOp.SUM, group=sp_group
             )
@@ -2000,7 +2255,7 @@ class FSDP2Backend(BaseBackend):
         if len(params) < 1:
             return
 
-        assert params[0].device_mesh == self._mesh["edp"]
+        assert self._parameter_ownership.is_expert(params[0])
         grads = [p.grad for p in params]
         torch._foreach_mul_(grads, self.gradient_scaling_factor)
 

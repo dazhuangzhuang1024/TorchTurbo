@@ -13,13 +13,16 @@ from ...base import BaseCheckpointManager
 from ....checkpoint.format import ComponentStatus
 from .layout import MODEL_DCP_DIR, OPTIMIZER_DCP_DIR, dcp_status
 from .dcp import DcpCheckpoint
+from .metadata import build_parallel_layout
 from .weight_loader import DistParamLoader
 from .weight_saver import ShardedParamManager
 
 if TYPE_CHECKING:
-    from torch.distributed.device_mesh import DeviceMesh
-
     from torchturbo.models.weight_converter import BaseWeightConverter
+    from torchturbo.engine.backends.fsdp2.parallel_context import (
+        ParallelContext,
+        ParameterOwnership,
+    )
     from torchturbo.runtime import DeviceRuntime
 
 
@@ -35,24 +38,31 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         self,
         *,
         rank: int,
-        mesh: DeviceMesh,
-        world_mesh: DeviceMesh,
-        parallel_context: dict[str, Any],
+        parallel_context: ParallelContext,
+        ownership: ParameterOwnership,
         device_runtime: DeviceRuntime,
         cpu_offload: bool,
         require_optimizer_not_suspended: Callable[[], None],
     ) -> None:
         self._rank = rank
-        self._mesh = mesh
-        self._world_mesh = world_mesh
+        self._parallel_context = parallel_context
+        self._ownership = ownership
         self._device_runtime = device_runtime
         self._cpu_offload = cpu_offload
         self._require_optimizer_not_suspended = require_optimizer_not_suspended
         self._dcp = DcpCheckpoint(
-            ep_rank=parallel_context["ep"]["ep_rank"],
-            ep_size=parallel_context["ep"]["ep_size"],
-            edp_mesh=mesh["edp"],
+            ep_rank=parallel_context.get_ep_info()["ep_rank"],
+            ep_size=parallel_context.get_ep_info()["ep_size"],
+            ownership=ownership,
+            stamp_all_aliases=parallel_context.tp_size > 1 or parallel_context.etp_size > 1,
         )
+
+    def checkpoint_layout(self, model: nn.Module) -> dict[str, Any] | None:
+        """Return collective resolved layouts for the new native TP path."""
+        context = self._parallel_context
+        if context.tp_size == 1 and context.etp_size == 1:
+            return None
+        return build_parallel_layout(model, context, self._ownership)
 
     def native_model_dir(self, checkpoint_dir: str) -> str:
         return os.path.join(checkpoint_dir, MODEL_DCP_DIR)
@@ -122,8 +132,8 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
             model=model,
             path=weights_dir,
             rank=self._rank,
-            mesh=self._mesh,
-            world_mesh=self._world_mesh,
+            mesh=self._parallel_context.expert_mesh,
+            parallel_context=self._parallel_context,
             device_runtime=self._device_runtime,
             is_cpu_offload=self._cpu_offload,
             weight_converter=converter,
@@ -138,8 +148,9 @@ class FSDP2CheckpointManager(BaseCheckpointManager):
         return ShardedParamManager(
             model=model,
             rank=self._rank,
-            mesh=self._mesh,
+            mesh=self._parallel_context.expert_mesh,
             weight_converter=converter,
+            parallel_context=self._parallel_context,
             device_runtime=self._device_runtime,
             path=source_path,
             is_cpu_offload=self._cpu_offload,

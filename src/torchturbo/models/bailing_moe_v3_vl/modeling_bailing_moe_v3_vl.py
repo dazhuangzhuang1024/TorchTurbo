@@ -33,6 +33,7 @@ from torch import nn
 from transformers import DynamicLayer
 from transformers import initialization as init
 from transformers import modeling_flash_attention_utils as flash_utils
+
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation.utils import GenerationMixin
@@ -51,6 +52,7 @@ from transformers.utils import (
 )
 from transformers.utils.deprecation import deprecate_kwarg
 
+from ..bailing_hybrid.attention import local_mla_rotary_key
 from ..bailing_hybrid.naive_kda import (
     NaiveShortConvolution as ShortConvolution,
 )
@@ -1381,6 +1383,7 @@ class BailingMoeV3MultiLatentAttention(nn.Module):
         k_pass, k_rot = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+        k_rot = local_mla_rotary_key(self, k_rot)
 
         k_pass = (
             self.kv_b_proj(self.kv_a_layernorm(k_pass)).view(key_shape).transpose(1, 2)
@@ -2159,12 +2162,10 @@ class BailingMoeV3Model(BailingMoeV3PreTrainedModel):
         batch_size, seq_length = inputs_embeds.shape[:2]
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
-        attention_layer = self.config.full_attention_layer_ids[0]
-        past_length = (
-            past_key_values.get_seq_length(attention_layer)
-            if past_key_values is not None
-            else 0
-        )
+        past_length = 0
+        if past_key_values is not None:
+            attention_layer = self.config.full_attention_layer_ids[0]
+            past_length = past_key_values.get_seq_length(attention_layer)
         if cache_position is None:
             cache_position = torch.arange(
                 past_length, past_length + seq_length, device=inputs_embeds.device

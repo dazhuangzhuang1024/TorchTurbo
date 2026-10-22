@@ -223,12 +223,11 @@ def _engine(monkeypatch, model, recipe, *, enabled=True):
 
     monkeypatch.setattr(muon_backend, "prepare_fsdp_muon_optimizers", prepare_children)
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = CpuRuntime()
     backend.fsdp_config = SimpleNamespace(cpu_offload=SimpleNamespace(enabled=False))
     backend._model_fqn_map = build_model_fqn_map(model)
-    backend._sp_group = None
-    backend._sp_size = 1
-    backend._sp_rank = 0
+    backend.get_sp_info = lambda: {"sp_group": None, "sp_size": 1, "sp_rank": 0}
     model.get_optimizer_recipe = lambda name: recipe
 
     engine = object.__new__(TorchTurboEngine)

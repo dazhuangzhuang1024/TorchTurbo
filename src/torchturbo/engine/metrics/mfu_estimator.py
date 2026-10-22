@@ -39,6 +39,7 @@ class MFUEstimator:
         self.flops_cls = flops_cls
         self.model_config = model_config
         self.sp_size = parallel_context["sp"]["sp_size"]
+        self.tp_size = parallel_context.get("tp", {"tp_size": 1})["tp_size"]
         self.device = runtime.current_device()
         self.gradient_checkpointing = engine_config.activation_checkpointing.enabled
         card = engine_config.mfu.card
@@ -60,9 +61,14 @@ class MFUEstimator:
         self.window_micros = 0
 
         self.logger = get_logger(__name__)
+        if self.tp_size > 1:
+            self.logger.info_rank0(
+                "TP HFU is unavailable: replicated compute and checkpoint "
+                "recomputation are not validated; reporting useful-model MFU only."
+            )
         self.logger.info_rank0(
-            "MFU estimator ready: recipe=%s hardware=%s sp_size=%d gc=%s peak=%.0f TFLOP/s",
-            flops_cls.__name__, self.hardware_label, self.sp_size,
+            "MFU estimator ready: recipe=%s hardware=%s sp_size=%d tp_size=%d gc=%s peak=%.0f TFLOP/s",
+            flops_cls.__name__, self.hardware_label, self.sp_size, self.tp_size,
             self.gradient_checkpointing, self.peak_tflops,
         )
 
@@ -107,10 +113,10 @@ class MFUEstimator:
         return _to_grid("image_grid_thw"), _to_grid("video_grid_thw")
 
     def forward_flops(self, inputs: dict) -> int:
-        """This device's forward FLOPs for one micro-batch's ``inputs``.
+        """Estimate useful-model forward work per participating device.
 
-        The recipe returns the full-input upper bound; the SP group cooperates on
-        one input, so this device's share is the total divided by ``sp_size``.
+        Full-input recipe work is shared across SP and TP ranks. This estimate
+        does not model replicated hardware work or checkpoint recomputation.
         """
         batch, seq = self._read_dims(inputs)
         if batch <= 0 or seq <= 0:
@@ -130,7 +136,7 @@ class MFUEstimator:
         )
         recipe = self.flops_cls(self.model_config, profile)
         total = int(sum(c.fwd_flops for c in recipe.components()))
-        return total // self.sp_size
+        return total // (self.sp_size * self.tp_size)
 
     def record_micro(self, inputs: dict) -> None:
         """Accumulate one micro's per-device FLOPs + tokens."""
@@ -144,7 +150,7 @@ class MFUEstimator:
         self.window_micros += 1
 
     def report(self) -> dict[str, "torch.Tensor"]:
-        """Per-rank {mfu, hfu} for the window since the last report (advances the clock)."""
+        """Report window MFU and legacy-only HFU, then advance the clock."""
         end_time = time.perf_counter()
         if self.window_micros == 0:
             return {}
@@ -159,15 +165,23 @@ class MFUEstimator:
         peak = self.peak_tflops
         mfu = tflops / peak
         hfu = (fwd * hfactor / 1e12 / dt) / peak
-        self.logger.debug(
-            "MFU window: mfu=%.4f hfu=%.4f tflops_per_gpu=%.2f window_time=%.3f window_flops=%d hfu_factor=%d",
-            mfu, hfu, tflops, dt, int(model_flops), hfactor,
-        )
+        if self.tp_size > 1:
+            self.logger.debug(
+                "Useful-model MFU window: mfu=%.4f tflops_per_device=%.2f "
+                "window_time=%.3f window_flops=%d",
+                mfu, tflops, dt, int(model_flops),
+            )
+        else:
+            self.logger.debug(
+                "MFU window: mfu=%.4f hfu=%.4f tflops_per_gpu=%.2f window_time=%.3f window_flops=%d hfu_factor=%d",
+                mfu, hfu, tflops, dt, int(model_flops), hfactor,
+            )
 
         metrics: dict[str, "torch.Tensor"] = {
             "mfu": torch.tensor(mfu, device=self.device),
-            "hfu": torch.tensor(hfu, device=self.device),
         }
+        if self.tp_size == 1:
+            metrics["hfu"] = torch.tensor(hfu, device=self.device)
 
         self.window_fwd = 0.0
         self.window_tokens = 0.0

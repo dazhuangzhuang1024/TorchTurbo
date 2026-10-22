@@ -27,6 +27,7 @@ from torchturbo.engine.optimizers import (
     MuonRecipe,
     Owned,
 )
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.utils.torch_utils import torch_version
 
@@ -240,7 +241,9 @@ def _run_distributed_muon_test(
             return model, optimizer
 
         model, optimizer = make_model_and_optimizer(values)
-        checkpoint_io = DcpCheckpoint(ep_rank=0, ep_size=1, edp_mesh=mesh)
+        ownership = ParameterOwnership()
+        ownership.register(model, set())
+        checkpoint_io = DcpCheckpoint(ep_rank=0, ep_size=1, ownership=ownership)
         use_dcp = offload_mode is not None or resumed_mode is not None
         checkpoint_dir = init_file + "-checkpoint"
         if use_dcp:
@@ -484,6 +487,7 @@ def _run_distributed_muon_test(
             # Load into a second fresh optimizer, whose state already exists, so
             # DCP fills the target mode's destinations without a dummy step.
             model, optimizer = make_model_and_optimizer(resumed_values)
+            ownership.register(model, set())
             initial_buffers = {
                 parameter: state["momentum_buffer"]
                 for parameter, state in optimizer.state.items()

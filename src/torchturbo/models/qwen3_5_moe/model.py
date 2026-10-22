@@ -266,6 +266,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
         sp_group = sp_info["sp_group"]
         sp_size = sp_info["sp_size"]
         sp_rank = sp_info["sp_rank"]
+        if sp_size > 1 or parallel_context["tp"]["tp_size"] > 1:
+            self.register_sp_attention_interface(sp_info)
         if sp_size > 1:
             from torchturbo.models.qwen3_5_moe.modeling_qwen3_5_moe import (
                 Qwen3_5MoeGatedDeltaNet,
@@ -275,11 +277,11 @@ class TurboQwen3_5MoeForConditionalGeneration(
             # Vision keeps flash_attention_2 on its own subconfig and stays
             # on the native flash path; only text attention switches to the
             # registered SP interface.
-            self.register_sp_attention_interface(sp_info)
-
-            self.patch_gated_delta_net_for_sp(
-                Qwen3_5MoeGatedDeltaNet, sp_group, sp_size, sp_rank
-            )
+            for attention in self.modules():
+                if isinstance(attention, Qwen3_5MoeGatedDeltaNet):
+                    self.patch_gated_delta_net_for_sp(
+                        attention, sp_group, sp_size, sp_rank
+                    )
 
             if self.mtp is not None:
                 self.patch_mtp_for_sp(
@@ -352,23 +354,23 @@ class TurboQwen3_5MoeForConditionalGeneration(
     def patch_gated_delta_net_for_sp(cls, attn_cls, sp_group, sp_size, sp_rank):
         """Head-parallel SP for GatedDeltaNet linear attention.
 
-        Each SP rank computes num_heads/sp_size heads on the full sequence.
+        Each SP rank computes TP-local num_heads/sp_size heads on the full sequence.
         Q/K/V are split first then gathered individually.
 
-        When sp_size > num_k_heads (e.g., SP=32 with 16 key heads),
+        When sp_size > TP-local num_k_heads (e.g., SP=32 with 16 key heads),
         Q/K heads are repeated by sp_repeat to match sp_size before
         the all-to-all. V already has enough heads and does NOT repeat.
 
-        Shape reference (Qwen3.5-35B-A3B):
-          nk_full = linear_num_key_heads = 16
-          nv_full = linear_num_value_heads = 32
+        Shape reference for TP-local heads (TP=1 shown):
+          nk_local = linear_num_key_heads / TP = 16
+          nv_local = linear_num_value_heads / TP = 32
           dk = linear_key_head_dim = 128
           dv = linear_value_head_dim = 128
-          G_orig = nv_full / nk_full = 2
+          G_orig = nv_local / nk_local = 2
 
-          sp_repeat = max(1, sp_size // nk_full)
-          sh = nk_full * sp_repeat      (super-head count)
-          G_per_sh = nv_full // sh       (value heads per super-head)
+          sp_repeat = max(1, sp_size // nk_local)
+          sh = nk_local * sp_repeat      (super-head count)
+          G_per_sh = nv_local // sh       (value heads per super-head)
 
           SP=1:  sp_repeat=1, sh=16, G_per_sh=2, nk=16, nv=32
           SP=2:  sp_repeat=1, sh=16, G_per_sh=2, nk=8,  nv=16
@@ -379,13 +381,15 @@ class TurboQwen3_5MoeForConditionalGeneration(
             gather_heads_scatter_seq,
         )
         from torchturbo.ops import ops
+        from .tensor_parallel import gated_norm, local_gdn_parameters
+        from types import MethodType
         import torch.nn.functional as F
 
         def _slice_param(weight, dim):
             """Slice a parameter along `dim` for this SP rank.
 
-            e.g., A_log [32] → [16] for SP=2 rank 0/1
-                  conv1d.weight [8192, 1, 4] → [4096, 1, 4] for SP=2 rank 0/1
+            e.g., A_log [32] -> [16] for SP=2 rank 0/1
+                  conv1d.weight [8192, 1, 4] -> [4096, 1, 4] for SP=2 rank 0/1
             """
             slices = [slice(None)] * weight.dim()
             d = weight.size(dim)
@@ -400,8 +404,9 @@ class TurboQwen3_5MoeForConditionalGeneration(
             # the full sequence on each rank.
             cu_seqlens = kwargs.get("cu_seq_lens")
             B, local_T, _ = hidden_states.shape
+            conv_weight, A_log, dt_bias = local_gdn_parameters(self_attn)
 
-            nk_full, nv_full = self_attn.num_k_heads, self_attn.num_v_heads
+            nk_local, nv_local = self_attn.num_k_heads, self_attn.num_v_heads
             dk, dv = self_attn.head_k_dim, self_attn.head_v_dim
 
             # Projections on local sequence shard [B, T/sp, *]
@@ -410,26 +415,26 @@ class TurboQwen3_5MoeForConditionalGeneration(
             b = self_attn.in_proj_b(hidden_states)
             a = self_attn.in_proj_a(hidden_states)
 
-            # Split fused QKV → Q/K repeat → super-head packing → all-to-all
+            # Split fused QKV -> Q/K repeat -> super-head packing -> all-to-all
             #
-            # When sp_size > nk_full (e.g., SP=32), Q/K have fewer heads (16)
+            # When sp_size > nk_local (e.g., SP=32), Q/K have fewer heads (16)
             # than SP groups (32). Solution: repeat Q/K heads by sp_repeat,
-            # so super-head count sh = nk_full * sp_repeat = sp_size.
+            # so super-head count sh = nk_local * sp_repeat = sp_size.
             #
-            # V has nv_full heads which is already >= sp_size, no repeat needed.
+            # V has nv_local heads which is already >= sp_size, no repeat needed.
             q_raw, k_raw, v_raw = torch.split(
                 mixed_qkv,
                 [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim],
                 dim=-1,
             )
 
-            sp_repeat = max(1, sp_size // nk_full)
-            sh = nk_full * sp_repeat  # super-head count
-            G_per_sh = nv_full // sh  # value heads per super-head
+            sp_repeat = max(1, sp_size // nk_local)
+            sh = nk_local * sp_repeat  # super-head count
+            G_per_sh = nv_local // sh  # value heads per super-head
 
             # Q/K: reshape to heads, repeat if sp_repeat > 1
-            q_shaped = q_raw.reshape(B, local_T, nk_full, dk)
-            k_shaped = k_raw.reshape(B, local_T, nk_full, dk)
+            q_shaped = q_raw.reshape(B, local_T, nk_local, dk)
+            k_shaped = k_raw.reshape(B, local_T, nk_local, dk)
             if sp_repeat > 1:
                 q_shaped = q_shaped.repeat_interleave(sp_repeat, dim=2)
                 k_shaped = k_shaped.repeat_interleave(sp_repeat, dim=2)
@@ -451,16 +456,16 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 sp_size=sp_size,
             )
             T = interleaved_qkv.shape[1]
-            nk = nk_full * sp_repeat // sp_size  # key heads per rank
-            nv = nv_full // sp_size  # value heads per rank
+            nk = nk_local * sp_repeat // sp_size  # key heads per rank
+            nv = nv_local // sp_size  # value heads per rank
 
-            # De-interleave super-head → separate Q, K, V
+            # De-interleave super-head -> separate Q, K, V
             q_raw = interleaved_qkv[..., :dk]
             k_raw = interleaved_qkv[..., dk : 2 * dk]
             v_raw = interleaved_qkv[..., 2 * dk :].reshape(B, T, nv, dv)
 
             # Conv1d on local heads
-            # Re-fuse Q/K/V → conv1d with sliced+repeated weights → re-split
+            # Re-fuse Q/K/V -> conv1d with sliced+repeated weights -> re-split
             local_qkv = torch.cat(
                 [
                     q_raw.reshape(B, T, nk * dk),
@@ -470,7 +475,7 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 dim=-1,
             )
 
-            w = self_attn.conv1d.weight  # [conv_dim, 1, kernel]
+            w = conv_weight  # [TP-local conv_dim, 1, kernel]
             wq, wk, wv = torch.split(
                 w,
                 [self_attn.key_dim, self_attn.key_dim, self_attn.value_dim],
@@ -484,9 +489,9 @@ class TurboQwen3_5MoeForConditionalGeneration(
             # first, repeat on head dim, then flatten back.
             K = self_attn.conv_kernel_size
             if sp_repeat > 1:
-                wq = wq.reshape(nk_full, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
-                wk = wk.reshape(nk_full, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
-            # wv: [nv_full * dv, 1, K] = [32*128, 1, 4], no repeat needed
+                wq = wq.reshape(nk_local, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
+                wk = wk.reshape(nk_local, dk, 1, K).repeat_interleave(sp_repeat, dim=0).reshape(-1, 1, K)
+            # wv: [nv_local * dv, 1, K] = [32*128, 1, 4], no repeat needed
 
             local_conv_weight = torch.cat(
                 [_slice_param(wq, 0), _slice_param(wk, 0), _slice_param(wv, 0)], dim=0
@@ -500,8 +505,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
                     dim=0,
                 )
                 if sp_repeat > 1:
-                    bq = bq.reshape(nk_full, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
-                    bk = bk.reshape(nk_full, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
+                    bq = bq.reshape(nk_local, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
+                    bk = bk.reshape(nk_local, dk).repeat_interleave(sp_repeat, dim=0).reshape(-1)
                 local_conv_bias = torch.cat(
                     [_slice_param(bq, 0), _slice_param(bk, 0), _slice_param(bv, 0)],
                     dim=0,
@@ -532,9 +537,9 @@ class TurboQwen3_5MoeForConditionalGeneration(
                 q = q.repeat_interleave(r, dim=2)
                 k = k.repeat_interleave(r, dim=2)
 
-            # All-to-all for z, b, a (use value-head dimension nv_full)
+            # All-to-all for z, b, a (use value-head dimension nv_local)
             z = gather_seq_scatter_heads(
-                z.reshape(B, local_T, nv_full, dv),
+                z.reshape(B, local_T, nv_local, dv),
                 seq_dim=1,
                 head_dim=2,
                 sp_group=sp_group,
@@ -557,8 +562,8 @@ class TurboQwen3_5MoeForConditionalGeneration(
 
             # Compute gate (beta) and delta (g)
             beta = b.sigmoid()
-            A_log_local = _slice_param(self_attn.A_log, 0)
-            dt_bias_local = _slice_param(self_attn.dt_bias, 0)
+            A_log_local = _slice_param(A_log, 0)
+            dt_bias_local = _slice_param(dt_bias, 0)
             g = -A_log_local.float().exp() * F.softplus(a.float() + dt_bias_local)
 
             # Chunk Gated Delta Rule (core linear attention)
@@ -583,10 +588,13 @@ class TurboQwen3_5MoeForConditionalGeneration(
             )
 
             # RMSNorm Gated + output projection
-            out = self_attn.norm(out.reshape(-1, dv), z.reshape(-1, dv))
+            out = gated_norm(self_attn, out.reshape(-1, dv), z.reshape(-1, dv))
             return self_attn.out_proj(out.reshape(B, local_T, -1))
 
-        attn_cls.forward = sp_forward
+        if isinstance(attn_cls, torch.nn.Module):
+            attn_cls.forward = MethodType(sp_forward, attn_cls)
+        else:
+            attn_cls.forward = sp_forward
 
     def get_weight_converter(self, parallel_context, model_path):
         return Qwen3_5MoeWeightConverter(self, parallel_context, model_path)

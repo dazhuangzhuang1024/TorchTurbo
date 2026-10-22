@@ -23,4 +23,6 @@ def get_parallel_plan() -> FSDPParallelPlan:
         },
         sp_size=1,
         ep_size=1,  # dense: no experts → EP disabled
+        tp_size=1,
+        etp_size=1,
     )

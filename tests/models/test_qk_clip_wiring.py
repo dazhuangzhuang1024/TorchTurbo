@@ -70,12 +70,10 @@ def _prepare_optimizer(attention: nn.Module) -> torch.optim.Optimizer:
         ),
     )
     backend = object.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = CpuRuntime()
     backend.fsdp_config = FSDPConfig()
-    backend._mesh = {"edp": object()}
-    backend._sp_group = None
-    backend._sp_size = 1
-    backend._sp_rank = 0
+    backend.get_sp_info = lambda: {"sp_group": None, "sp_size": 1, "sp_rank": 0}
     return backend.prepare_optimizer(plan)
 
 
@@ -96,7 +94,9 @@ def test_prepared_attention_collects_only_training_logits(monkeypatch, model_nam
             # interface at any SP size, and the forward resolves it from the
             # registry by config name.
             model = object.__new__(TurboBailingMoeV3ForCausalLM)
+            nn.Module.__init__(model)
             model.config = attention.config
+            model.attention = attention
             model.register_sp_attention_interface(
                 {"sp_group": None, "sp_size": 1}
             )

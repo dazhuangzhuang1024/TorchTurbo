@@ -16,7 +16,10 @@ from ..utils import is_peft_adapter_param
 from . import layout
 from .distributed import collective_check, rank_zero_call
 from .format import CheckpointFormat, ComponentStatus
-from .metadata import build_metadata, load_metadata, save_metadata, validate_peft_configs
+from .metadata import (
+    build_metadata, load_metadata, save_metadata, validate_parallel_layout,
+    validate_peft_configs,
+)
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -76,8 +79,11 @@ class CheckpointCoordinator:
         else:
             formats = (CheckpointFormat.NATIVE,)
 
+        parallel_layout = self._manager.checkpoint_layout(model)
         metadata = collective_check(
-            lambda: build_metadata(model, self._config, source_path)
+            lambda: build_metadata(
+                model, self._config, source_path, parallel_layout=parallel_layout
+            )
         )
 
         # A model save starts a new checkpoint generation. Reset once before
@@ -124,9 +130,7 @@ class CheckpointCoordinator:
             )
         )
         if model_format is CheckpointFormat.NATIVE:
-            metadata = rank_zero_call(lambda: load_metadata(checkpoint_dir))
-            if metadata is not None:
-                collective_check(lambda: validate_peft_configs(model, metadata))
+            self._validate_native_metadata(model, checkpoint_dir)
             self._manager.load_native(
                 model, self._manager.native_model_dir(checkpoint_dir)
             )
@@ -195,11 +199,24 @@ class CheckpointCoordinator:
 
         scheduler_state = rank_zero_call(preflight)
 
+        self._validate_native_metadata(model, checkpoint_dir)
         self._manager.load_optimizer(model, optimizer, optimizer_dir)
         if isinstance(optimizer, OptimizersContainer):
             optimizer.refresh_param_groups()
         if lr_scheduler is not None:
             lr_scheduler.load_state_dict(scheduler_state)
+
+    def _validate_native_metadata(self, model: nn.Module, checkpoint_dir: str) -> None:
+        """Validate both independently callable native restore paths."""
+        metadata = rank_zero_call(lambda: load_metadata(checkpoint_dir))
+        current = self._manager.checkpoint_layout(model)
+
+        def validate() -> None:
+            validate_parallel_layout(metadata, current)
+            if metadata is not None:
+                validate_peft_configs(model, metadata)
+
+        collective_check(validate)
 
     def _weight_converter(
         self, model: nn.Module, source_path: str

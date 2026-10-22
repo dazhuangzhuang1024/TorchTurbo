@@ -41,6 +41,7 @@ from torchturbo.models.modules.attention import interface
 from torchturbo.models.modules.attention.qk_clip import get_qk_clip_state
 from torchturbo.ops.providers.native.attention import TorchAttentionWithMaxLogits
 from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
+from torchturbo.engine.backends.fsdp2.parallel_context import ParameterOwnership
 from torchturbo.runtime.cpu import CpuRuntime
 
 
@@ -444,6 +445,7 @@ def test_nonfinite_grad_norm_stops_before_optimizer_and_qk_clip(
     original_grad = module.query_weight.grad.clone()
 
     backend = FSDP2Backend.__new__(FSDP2Backend)
+    backend._parallel_context = None
     backend._device_runtime = CpuRuntime()
     backend._mesh = None
     backend.fsdp_config = SimpleNamespace(
@@ -484,8 +486,9 @@ def _run_nonfinite_checks(rank: int, world_size: int, init_file: str) -> None:
                         assert_finite(value, "loss")
 
         backend = FSDP2Backend.__new__(FSDP2Backend)
+        backend._parallel_context = None
         backend._device_runtime = CpuRuntime()
-        backend._mesh = expert_mesh
+        backend.get_ep_info = lambda: {"ep_group": expert_mesh["ep"].get_group()}
         backend.gradient_scaling_factor = 1.0 / world_size
         for full_offload in (False, True):
             backend.fsdp_config = SimpleNamespace(
@@ -497,6 +500,11 @@ def _run_nonfinite_checks(rank: int, world_size: int, init_file: str) -> None:
                     parameter = nn.Parameter(distribute_tensor(torch.ones(2), mesh, (Shard(0),)))
                 else:
                     parameter = nn.Parameter(torch.ones(2))
+                model = nn.ParameterDict({"parameter": parameter})
+                backend._parameter_ownership = ParameterOwnership()
+                backend._parameter_ownership.register(
+                    model, {parameter} if layout == "moe" else set()
+                )
                 optimizer = torch.optim.SGD([parameter], lr=0.1, momentum=0.9)
                 for norm_type in (2.0, float("inf")):
                     for invalid in invalid_values:
@@ -519,6 +527,11 @@ def _run_nonfinite_checks(rank: int, world_size: int, init_file: str) -> None:
             dense = nn.Parameter(distribute_tensor(torch.ones(2), dense_mesh, (Shard(0),)))
             expert = nn.Parameter(distribute_tensor(torch.ones(2), expert_mesh["edp"], (Shard(0),)))
             replicated = nn.Parameter(torch.ones(1))
+            model = nn.ParameterDict({
+                "dense": dense, "expert": expert, "replicated": replicated,
+            })
+            backend._parameter_ownership = ParameterOwnership()
+            backend._parameter_ownership.register(model, {expert})
             for norm_type in (2.0, float("inf")):
                 expected_norm = (3.0**2 * 2 + 4.0**2 * 2 * world_size + 12.0**2) ** 0.5
                 if norm_type == float("inf"):
