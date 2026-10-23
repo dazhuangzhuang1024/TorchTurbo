@@ -25,6 +25,8 @@ def _replace_moe_only(
         hf_config=hf_config,
         ep_size=ep_size,
         num_moe_experts=hf_config.n_routed_experts,
+        moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
+        moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
         moe_router_num_groups=hf_config.n_group,
         moe_router_group_topk=hf_config.topk_group,
@@ -40,6 +42,7 @@ def _replace_moe_only(
         config=moe_config,
         ep_group=ep_group,
         submodules=moe_submodules,
+        sp_group=sp_info["sp_group"],
     )
 
     if hasattr(original_module, "shared_experts"):

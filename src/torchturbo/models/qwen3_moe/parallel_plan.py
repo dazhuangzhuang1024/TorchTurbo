@@ -21,6 +21,8 @@ class QWen3MoeLayerWrapper(MoELayer):
             ep_size=ep_size,
             num_moe_experts=hf_config.num_experts,
             params_dtype=hf_config.torch_dtype,
+            moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
+            moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
             moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
             moe_router_normalize_topk_prob=hf_config.norm_topk_prob,
             moe_permute_fusion=True,
@@ -31,6 +33,7 @@ class QWen3MoeLayerWrapper(MoELayer):
             config=moe_config,
             ep_group=ep_group,
             submodules=moe_submodules,
+            sp_group=sp_info["sp_group"],
         )
 
         if hasattr(original_module, "shared_experts"):

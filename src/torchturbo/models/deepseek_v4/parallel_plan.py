@@ -65,6 +65,8 @@ def _replace_moe_only(
         ep_size=ep_size,
         num_moe_experts=hf_config.n_routed_experts,
         params_dtype=_dtype_from_config(hf_config),
+        moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
+        moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
         moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
         moe_router_score_function=hf_config.scoring_func,
@@ -82,6 +84,7 @@ def _replace_moe_only(
         ep_group=ep_group,
         submodules=moe_submodules,
         layer_number=layer_number,
+        sp_group=sp_info["sp_group"],
     )
 
     if hasattr(original_module, "shared_experts"):
