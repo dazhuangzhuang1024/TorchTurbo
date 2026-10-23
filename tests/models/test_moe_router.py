@@ -1,9 +1,75 @@
 """Tests for shared MoE router behavior."""
 
+import pytest
 import torch
+import torch.nn.functional as F
 
 from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.router import TopKRouter
+from torchturbo.models.modules.moe.utils import topk_softmax_with_capacity
+
+
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_low_precision_scores_do_not_change_selected_expert(score_function, dtype):
+    logits = torch.tensor([[0.0, 0.0001]], dtype=dtype)
+    routing = topk_softmax_with_capacity(
+        logits, 1, use_pre_softmax=True, score_function=score_function,
+    )
+
+    torch.testing.assert_close(routing.routing_map, torch.tensor([[False, True]]))
+    torch.testing.assert_close(routing.expert_indices, torch.tensor([[1]]))
+
+
+@pytest.mark.parametrize("score_function", ["sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("hash_routing", [False, True])
+def test_probability_normalization_and_scaling_use_fp32(score_function, hash_routing):
+    logits = torch.tensor([[2.0, 1.0, -1.0]], dtype=torch.bfloat16, requires_grad=True)
+    reference_logits = logits.detach().float().requires_grad_()
+    score_func = torch.sigmoid if score_function == "sigmoid" else lambda x: F.softplus(x).sqrt()
+    selected_scores = score_func(reference_logits)[:, :2]
+    expected = (selected_scores / selected_scores.sum(-1, keepdim=True) * 1.7).to(logits.dtype)
+    kwargs = {}
+    if hash_routing:
+        kwargs = {
+            "use_hash_routing": True,
+            "hash_table": torch.tensor([[0, 1]]),
+            "input_ids": torch.tensor([0]),
+        }
+
+    routing = topk_softmax_with_capacity(
+        logits, 2, score_function=score_function, scaling_factor=1.7, **kwargs,
+    )
+    probs = routing.probs
+
+    torch.testing.assert_close(probs[:, :2], expected, rtol=0, atol=0)
+    gradient = torch.tensor([[1.0, 3.0]], dtype=logits.dtype)
+    (probs[:, :2] * gradient).sum().backward()
+    (expected * gradient).sum().backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad.to(logits.dtype), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_softmax_normalization_precedes_scaling(normalize):
+    config = MoEConfig(
+        hidden_size=1, num_moe_experts=3, moe_router_topk=2,
+        moe_router_pre_softmax=True, moe_router_normalize_topk_prob=normalize,
+        moe_router_topk_scaling_factor=2.0,
+    )
+    router = TopKRouter(config)
+    logits = torch.tensor([[[2.0, 1.0, 0.0]]], requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_()
+    expected = reference_logits.softmax(-1)[..., :2]
+    if normalize:
+        expected = expected / expected.sum(-1, keepdim=True)
+    expected = expected * 2.0
+
+    probs = router.routing(logits).probs
+
+    torch.testing.assert_close(probs[:, :2], expected.reshape(1, 2))
+    (probs * torch.tensor([[1.0, 3.0, 0.0]])).sum().backward()
+    (expected * torch.tensor([1.0, 3.0])).sum().backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
 
 
 def _router_config() -> MoEConfig:
