@@ -63,10 +63,11 @@ class Router(ABC, torch.nn.Module):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == "fp64":
             router_dtype = torch.float64
-        # HACK: avoid unexpected dtype conversion
-        logits = torch.nn.functional.linear(
-            input.to(router_dtype), self.weight.to(router_dtype)
-        ).to(router_dtype)
+        # Autocast must not override the router's compute dtype.
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            logits = torch.nn.functional.linear(
+                input.to(router_dtype), self.weight.to(router_dtype)
+            )
         return logits
 
 

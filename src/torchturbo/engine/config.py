@@ -473,6 +473,12 @@ class MoEConfig:
 
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
+    token_dispatcher: str = "alltoall"
+    """Expert token dispatcher type."""
+
+    def __post_init__(self) -> None:
+        if self.token_dispatcher != "alltoall":
+            raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
 
 @dataclass
@@ -1281,6 +1287,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     return MoEConfig(
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
+        token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),
     )
 
 

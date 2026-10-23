@@ -11,7 +11,8 @@ from ..modules.moe.config_converter import get_base_moe_config
 class QWen3MoeLayerWrapper(MoELayer):
 
     def __init__(
-        self, original_module, hf_config, sp_info, ep_info, moe_submodules, **kwargs
+        self, original_module, hf_config, sp_info, ep_info, moe_submodules,
+        engine_config, **kwargs
     ):
         ep_group = ep_info["ep_group"]
         ep_size = ep_info["ep_size"]
@@ -20,6 +21,8 @@ class QWen3MoeLayerWrapper(MoELayer):
             ep_size=ep_size,
             num_moe_experts=hf_config.num_experts,
             params_dtype=hf_config.torch_dtype,
+            moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
+            moe_router_pre_softmax=not hf_config.norm_topk_prob,
         )
         moe_config = MoEConfig(**qwen3_config_kwargs)
 

@@ -51,21 +51,17 @@ class MoEConfig:
     moe_router_num_groups: Optional[int] = None
     """Number of selected groups for group-limited routing."""
     moe_router_group_topk: Optional[int] = None
-    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the 
-    top-k selection."""
+    """Apply softmax before top-k; otherwise apply it to the selected logits."""
     moe_router_pre_softmax: bool = False
-    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
-    enabled. """
+    """Scaling factor applied after top-k selection and any probability normalization."""
     moe_router_topk_scaling_factor: Optional[float] = None
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
     moe_router_score_function: str = "softmax"
     moe_router_dtype: Optional[str] = None
     moe_router_enable_expert_bias: bool = False
     """The type of token dispatcher to use."""
-    moe_token_dispatcher_type: str = "allgather"
-    """Fuse token rearrangement ops during token dispatching."""
-    moe_permute_fusion: bool = False
-    """Apply probs on input of experts instead of applying after activation and glu."""
+    moe_token_dispatcher_type: str = "alltoall"
+    """Apply probabilities to expert inputs instead of activations before FC2."""
     moe_apply_probs_on_input: bool = False
     """Per-layer swiglu limit for clamping gate/up values in SwiGLU activation."""
     moe_swiglu_limit: Optional[List[float]] = None

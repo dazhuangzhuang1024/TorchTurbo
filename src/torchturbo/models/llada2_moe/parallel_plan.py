@@ -6,7 +6,8 @@ from ..modules.moe.config_converter import get_base_moe_config
 
 
 def _replace_llada2_moe_only(
-    original_module, hf_config, sp_info, ep_info, moe_submodules, **kwargs
+    original_module, hf_config, sp_info, ep_info, moe_submodules,
+    engine_config, **kwargs
 ):
     from .modeling_llada2_moe import LLaDA2MoeSparseMoeBlock
 
@@ -21,6 +22,7 @@ def _replace_llada2_moe_only(
         ep_size=ep_size,
         num_moe_experts=hf_config.num_experts,
         params_dtype=hf_config.torch_dtype,
+        moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
         moe_router_score_function="sigmoid",
         moe_router_num_groups=hf_config.n_group,
         moe_router_group_topk=hf_config.topk_group,
