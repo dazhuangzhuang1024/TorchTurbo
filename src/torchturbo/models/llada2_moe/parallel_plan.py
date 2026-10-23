@@ -14,6 +14,11 @@ def _replace_llada2_moe_only(
     if not isinstance(original_module, LLaDA2MoeSparseMoeBlock):
         return original_module
 
+    assert (
+        engine_config.moe.aux_loss_coeff == 0.0
+        and engine_config.moe.z_loss_coeff == 0.0
+    ), "LLaDA2 diffusion does not support MoE aux/z losses; set both coefficients to 0."
+
     ep_group = ep_info["ep_group"]
     ep_size = ep_info["ep_size"]
 
@@ -37,6 +42,7 @@ def _replace_llada2_moe_only(
         config=moe_config,
         ep_group=ep_group,
         submodules=moe_submodules,
+        sp_group=sp_info["sp_group"],
     )
 
     if hasattr(original_module, "shared_experts"):
