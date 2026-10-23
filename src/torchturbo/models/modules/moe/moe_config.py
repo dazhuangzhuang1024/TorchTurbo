@@ -76,3 +76,12 @@ class MoEConfig:
     def __post_init__(self):
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
+        if (
+            self.moe_router_enable_expert_bias
+            and self.moe_router_score_function == "softmax"
+            and not self.moe_router_pre_softmax
+        ):
+            raise ValueError(
+                "Softmax expert bias requires moe_router_pre_softmax=True; "
+                "post-top-k softmax would ignore the bias."
+            )

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from torchturbo.models.modules.moe.moe_config import MoEConfig
+from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.models.modules.moe.router import TopKRouter
 from torchturbo.models.modules.moe.utils import topk_softmax_with_capacity
 from torchturbo.runtime import is_cuda_available, is_npu_available
@@ -40,6 +41,14 @@ def test_gating_preserves_compute_dtype_and_gradients_under_autocast(device, inp
     expected.backward(gradient)
     torch.testing.assert_close(inputs.grad, ref_inputs.grad, rtol=0, atol=0)
     torch.testing.assert_close(router.weight.grad, ref_weight.grad, rtol=0, atol=0)
+
+
+def test_softmax_expert_bias_requires_pre_softmax():
+    with pytest.raises(ValueError, match="moe_router_pre_softmax=True"):
+        MoEConfig(num_moe_experts=4, moe_router_enable_expert_bias=True)
+    MoEConfig(
+        num_moe_experts=4, moe_router_enable_expert_bias=True, moe_router_pre_softmax=True,
+    )
 
 
 @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
@@ -104,6 +113,19 @@ def test_hash_softmax_respects_normalization_order(use_pre_softmax):
     torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=0, atol=0)
 
 
+def test_z_loss_is_zero_for_an_empty_source_rank():
+    router = TopKRouter(MoEConfig(
+        hidden_size=2, num_moe_experts=4, moe_router_topk=2, moe_z_loss_coeff=0.3,
+    ))
+    inputs = torch.empty(0, 1, 2, requires_grad=True)
+    routing, _ = router(inputs)
+    metrics = router.pop_metrics()
+    torch.testing.assert_close(metrics["z_loss"], torch.tensor(0.0))
+    torch.testing.assert_close(metrics["z_loss_scaled"], torch.tensor(0.0))
+    routing.probs.sum().backward()
+    torch.testing.assert_close(router.weight.grad, torch.zeros_like(router.weight))
+
+
 @pytest.mark.parametrize("use_pre_softmax", [False, True])
 def test_softmax_normalization_precedes_scaling(use_pre_softmax):
     config = MoEConfig(
@@ -126,6 +148,66 @@ def test_softmax_normalization_precedes_scaling(use_pre_softmax):
     (probs * torch.tensor([[1.0, 3.0, 0.0]])).sum().backward()
     (expected * torch.tensor([1.0, 3.0])).sum().backward()
     torch.testing.assert_close(logits.grad, reference_logits.grad)
+
+
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("layer_number", [0, 1], ids=["hash", "learned"])
+@pytest.mark.parametrize("z_coeff", [0.0, 0.3])
+def test_hash_layers_keep_main_and_z_gradients_without_learned_aux(
+    monkeypatch, score_function, layer_number, z_coeff,
+):
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "loss_scale", 1.0)
+    router = TopKRouter(
+        MoEConfig(
+            hidden_size=2, num_moe_experts=4, moe_router_topk=2,
+            moe_router_score_function=score_function,
+            moe_router_pre_softmax=True,
+            num_hash_layers=1, vocab_size=2,
+            moe_aux_loss_coeff=0.2, moe_z_loss_coeff=z_coeff,
+        ),
+        layer_number=layer_number,
+    )
+    hash_table = torch.tensor([[0, 1], [2, 3]])
+    with torch.no_grad():
+        router.weight.copy_(torch.tensor([[0.5, 0.1], [0.2, -0.3], [-0.4, 0.7], [0.6, -0.5]]))
+        if layer_number == 0:
+            router.tid2eid.copy_(hash_table)
+    inputs = torch.tensor([[[1., 2.], [2., -1.]]], requires_grad=True)
+    ref_inputs = inputs.detach().clone().requires_grad_()
+    ref_weight = router.weight.detach().clone().requires_grad_()
+    logits = F.linear(ref_inputs, ref_weight).reshape(-1, 4)
+    if score_function == "softmax":
+        scores = logits.softmax(-1)
+    elif score_function == "sigmoid":
+        scores = logits.sigmoid()
+    else:
+        scores = F.softplus(logits).sqrt()
+    indices = hash_table if layer_number == 0 else scores.topk(2, dim=-1).indices
+    selected = scores.gather(1, indices)
+    if score_function != "softmax":
+        selected = selected / selected.sum(-1, keepdim=True)
+    expected_probs = torch.zeros_like(scores).scatter(
+        1, indices, selected,
+    )
+    coefficients = torch.tensor([[1., 2., 4., 8.], [3., 5., 2., 1.]])
+    expected_loss = (expected_probs * coefficients).sum()
+    expected_loss = expected_loss + z_coeff * logits.logsumexp(-1).square().mean()
+    if layer_number == 1:
+        aux_scores = scores / scores.sum(-1, keepdim=True)
+        counts = torch.bincount(indices.flatten(), minlength=4)
+        expected_loss = expected_loss + 0.2 * 4 * (aux_scores.sum(0) * counts).sum() / (2 * 2**2)
+
+    routing, _ = router(inputs, input_ids=torch.tensor([[0, 1]]))
+    (routing.probs * coefficients).sum().backward()
+    expected_loss.backward()
+
+    torch.testing.assert_close(routing.probs, expected_probs)
+    torch.testing.assert_close(routing.routing_map, expected_probs != 0)
+    torch.testing.assert_close(router.weight.grad, ref_weight.grad)
+    torch.testing.assert_close(inputs.grad, ref_inputs.grad)
+    metrics = router.pop_metrics()
+    assert ("aux_loss" in metrics) == (layer_number == 1)
+    assert ("z_loss" in metrics) == (z_coeff > 0)
 
 
 def _router_config() -> MoEConfig:

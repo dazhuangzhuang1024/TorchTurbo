@@ -14,6 +14,11 @@ def _replace_llada2_moe_only(
     if not isinstance(original_module, LLaDA2MoeSparseMoeBlock):
         return original_module
 
+    assert (
+        engine_config.moe.aux_loss_coeff == 0.0
+        and engine_config.moe.z_loss_coeff == 0.0
+    ), "LLaDA2 diffusion does not support MoE aux/z losses; set both coefficients to 0."
+
     ep_group = ep_info["ep_group"]
     ep_size = ep_info["ep_size"]
 
@@ -24,6 +29,8 @@ def _replace_llada2_moe_only(
         params_dtype=hf_config.torch_dtype,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
         moe_router_score_function="sigmoid",
+        # LLaDA2.1-mini uses topk=8 and group_topk=4, so the MoE layer's
+        # topk // group_topk rule matches the native gate's top-2 group scores.
         moe_router_num_groups=hf_config.n_group,
         moe_router_group_topk=hf_config.topk_group,
         moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
@@ -36,6 +43,7 @@ def _replace_llada2_moe_only(
         config=moe_config,
         ep_group=ep_group,
         submodules=moe_submodules,
+        sp_group=sp_info["sp_group"],
     )
 
     if hasattr(original_module, "shared_experts"):

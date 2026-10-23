@@ -32,11 +32,13 @@ def _replace_kimi_moe_only(
         hf_config=language_config,
         ep_size=ep_size,
         num_moe_experts=language_config.n_routed_experts,
+        moe_aux_loss_coeff=engine_config.moe.aux_loss_coeff,
+        moe_z_loss_coeff=engine_config.moe.z_loss_coeff,
         moe_token_dispatcher_type=engine_config.moe.token_dispatcher,
         moe_router_num_groups=language_config.n_group,
         moe_router_group_topk=language_config.topk_group,
         moe_router_topk_scaling_factor=language_config.routed_scaling_factor,
-        moe_router_score_function=language_config.scoring_func,
+        moe_router_score_function="sigmoid",
         moe_router_dtype="fp32",
         moe_router_enable_expert_bias=True,
     )
@@ -46,6 +48,7 @@ def _replace_kimi_moe_only(
         config=moe_config,
         ep_group=ep_group,
         submodules=moe_submodules,
+        sp_group=sp_info["sp_group"],
     )
 
     if hasattr(original_module, "shared_experts"):
