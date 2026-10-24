@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from .moe_config import MoEConfig
+from .virtual_expert_weights import VirtualExpertWeightPlan
 from torchturbo.ops import ops
 from torchturbo.logging import get_logger
 
@@ -46,6 +47,8 @@ class GroupedMLP(torch.nn.Module):
         layer_number: int = None,
     ):
         super().__init__()
+        if config.moe_token_dispatcher_type == "moon" and use_te:
+            raise ValueError("Moon EP does not support TE experts; use fused-weight GroupedMLP.")
         self.config = config
         self.num_local_experts = num_local_experts
         self.layer_number = layer_number
@@ -190,8 +193,22 @@ class GroupedMLP(torch.nn.Module):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        expert_plan: VirtualExpertWeightPlan | None = None,
     ) -> tuple[torch.Tensor, None]:
         """Apply routing probabilities inside each expert before its second linear."""
+        if not (transformer_engine_is_available() and self.use_te):
+            w1 = self.weight1.view(
+                self.num_local_experts, self.config.hidden_size, -1,
+            )
+            w2 = self.weight2.view(
+                self.num_local_experts, -1, self.config.hidden_size,
+            )
+            if expert_plan is not None:
+                # Run communication before any saved GEMM activations so
+                # non-reentrant checkpoint early-stop cannot skip the exchange.
+                w1, w2, permuted_local_hidden_states, permuted_probs = expert_plan.materialize(
+                    w1, w2, permuted_local_hidden_states, permuted_probs,
+                )
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
@@ -235,14 +252,6 @@ class GroupedMLP(torch.nn.Module):
             fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
         elif permuted_local_hidden_states.nelement() != 0:
             # Fall back to the grouped_matmul op registry.
-            # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(
-                self.num_local_experts, self.config.hidden_size, -1
-            )
-            w2 = self.weight2.view(
-                self.num_local_experts, -1, self.config.hidden_size
-            )
-
             fc1_output = ops.grouped_matmul(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
             )
@@ -257,8 +266,8 @@ class GroupedMLP(torch.nn.Module):
             assert torch.count_nonzero(tokens_per_expert) == 0
 
             # Make sure params of experts still have gradients even given zero tokens.
-            w1 = self.weight1.view(self.config.hidden_size, -1)
-            w2 = self.weight2.view(-1, self.config.hidden_size)
+            w1 = w1.reshape(self.config.hidden_size, -1)
+            w2 = w2.reshape(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
             h = self.activation_func_with_probs(h, activation_probs)
             fc2_output = torch.matmul(h, w2)

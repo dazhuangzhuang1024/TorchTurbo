@@ -176,6 +176,35 @@ def test_build_from_yaml_with_engineconfig_wrapper(tmp_path):
     assert cfg.activation_checkpointing.enabled is False
 
 
+def test_moon_dispatcher_from_yaml(tmp_path):
+    path = _write(
+        tmp_path, "moe.yaml", _engine_config("moe:\n  token_dispatcher: moon\n")
+    )
+
+    cfg = _build_from_argv(["--tt_config", path])
+
+    assert cfg.moe.token_dispatcher == "moon"
+    assert EngineConfig.from_dict(cfg.to_dict()).moe.token_dispatcher == "moon"
+
+
+def test_moon_dispatcher_cli_overrides_yaml(tmp_path):
+    path = _write(
+        tmp_path, "moe.yaml", _engine_config("moe:\n  token_dispatcher: alltoall\n")
+    )
+
+    cfg = _build_from_argv([
+        "--tt_config", path, "--tt_moe_token_dispatcher", "moon",
+    ])
+
+    assert cfg.moe.token_dispatcher == "moon"
+
+
+def test_moon_dispatcher_from_env(monkeypatch):
+    monkeypatch.setenv("TORCH_TURBO_MOE_TOKEN_DISPATCHER", "moon")
+
+    assert _build_from_argv([]).moe.token_dispatcher == "moon"
+
+
 def test_build_from_json_with_engineconfig_wrapper(tmp_path):
     data = {
         "engine_config": {

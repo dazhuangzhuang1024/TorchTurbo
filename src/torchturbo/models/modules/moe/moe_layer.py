@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
+from .moon_dispatcher import MoEMoonTokenDispatcher
 from .module import ModuleSpec, build_module
 
 
@@ -124,6 +125,11 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 ep_group=ep_group,
             )
+        elif config.moe_token_dispatcher_type == "moon":
+            self.token_dispatcher = MoEMoonTokenDispatcher(
+                self.num_local_experts,
+                config=self.config, ep_group=ep_group,
+            )
         else:
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
@@ -159,8 +165,14 @@ class MoELayer(BaseMoELayer):
         expert_input, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
             received, received_probs,
         )
-        expert_output, bias = self.experts(expert_input, tokens_per_expert, expert_probs)
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        if isinstance(dispatcher, MoEMoonTokenDispatcher):
+            expert_output, bias = self.experts(
+                expert_input, tokens_per_expert, expert_probs,
+                expert_plan=dispatcher.expert_plan,
+            )
+        else:
+            expert_output, bias = self.experts(expert_input, tokens_per_expert, expert_probs)
+        assert bias is None, "Bias is not supported in MoE token dispatch"
         combined = dispatcher.combine_preprocess(expert_output)
         returned = dispatcher.token_combine(combined)
         output = dispatcher.combine_postprocess(returned)

@@ -474,11 +474,11 @@ class MoEConfig:
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
     token_dispatcher: str = "alltoall"
-    """Expert token dispatcher type."""
+    """Expert token dispatcher type: alltoall or moon."""
 
     def __post_init__(self) -> None:
-        if self.token_dispatcher != "alltoall":
-            raise ValueError("moe.token_dispatcher must be 'alltoall'.")
+        if self.token_dispatcher not in ("alltoall", "moon"):
+            raise ValueError("moe.token_dispatcher must be 'alltoall' or 'moon'.")
 
 
 @dataclass

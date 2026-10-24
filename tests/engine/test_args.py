@@ -115,17 +115,29 @@ def test_parse_torchturbo_args_moe_aux_loss():
     assert config.moe.aux_loss_coeff == 0.01
 
 
-def test_moe_dispatcher_config():
+@pytest.mark.parametrize("dispatcher", ["alltoall", "moon"])
+def test_moe_dispatcher_config(dispatcher):
     from torchturbo.engine.args import parse_torchturbo_args
     from torchturbo.engine.config import EngineConfig, build_from_args
 
-    args, remaining = parse_torchturbo_args(["--tt_moe_token_dispatcher", "alltoall"])
+    args, remaining = parse_torchturbo_args(["--tt_moe_token_dispatcher", dispatcher])
     assert remaining == []
+    assert args.moe_token_dispatcher == dispatcher
     config = build_from_args(args)
-    assert config.moe.token_dispatcher == "alltoall"
-    assert EngineConfig.from_dict(config.to_dict()).moe.token_dispatcher == "alltoall"
+    assert config.moe.token_dispatcher == dispatcher
+    assert EngineConfig.from_dict(config.to_dict()).moe.token_dispatcher == dispatcher
     with pytest.raises(ValueError, match="moe.token_dispatcher"):
         EngineConfig.from_dict({"moe": {"token_dispatcher": "invalid"}})
+
+
+def test_moe_dispatcher_defaults_to_alltoall(monkeypatch):
+    from torchturbo.engine.args import parse_torchturbo_args
+    from torchturbo.engine.config import build_from_args
+
+    monkeypatch.delenv("TORCH_TURBO_MOE_TOKEN_DISPATCHER", raising=False)
+    args, _ = parse_torchturbo_args([])
+    assert args.moe_token_dispatcher is None
+    assert build_from_args(args).moe.token_dispatcher == "alltoall"
 
 
 def test_parse_torchturbo_args_moe_z_loss():

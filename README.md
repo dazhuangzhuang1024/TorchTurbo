@@ -102,6 +102,35 @@ argument and return formats while exchanging media and restoring their order.
 The boundary must be called in the same order on every WORLD rank. Bailing V3 VL
 provides this implementation; other towers require their own I/O contract.
 
+MoE token dispatch defaults to `alltoall`. Select MoonEP-style virtual expert
+balancing with the existing dispatcher setting:
+
+```yaml
+engine_config:
+  moe:
+    token_dispatcher: moon
+```
+
+The same choice is available through `--tt_moe_token_dispatcher moon` or
+`TORCH_TURBO_MOE_TOKEN_DISPATCHER=moon`. Moon temporarily replicates selected
+expert weights, redistributes their routes across EP ranks, and sums replica
+gradients back into the original expert parameters. Parameter shapes and
+checkpoint layouts stay compatible with `alltoall`.
+
+This is an eager implementation of the MoonEP balancing algorithm using native
+PyTorch, CPU planning, and selective weight all-to-all communication. Histogram
+planning synchronizes the device with the CPU once per layer forward, including
+whole-MoE checkpoint recomputation. Runtime probabilities and routing maps use
+`[tokens, 2 * num_experts]` storage. The planner is deterministic for a given
+histogram; checkpoint recomputation must reproduce the logical router choices.
+It does not provide optimized MoonEP kernels; planning and communication overhead need
+target-system benchmarks. Fused-weight `GroupedMLP` is required. Transformer
+Engine experts and expert LoRA are unsupported; attention-only LoRA is supported.
+CPU planning also prevents CUDA graph capture. CUDA and NPU correctness and
+performance, including fused permutation with the expanded expert dimension,
+have not yet been validated on target hardware. Every EP rank must participate
+in the same forward and backward calls with compatible autograd participation.
+
 ### Backend
 
 Currently available backend:
@@ -332,6 +361,7 @@ docs/runs/
 | `TORCH_TURBO_USE_DETERMINISTIC_ALGORITHMS=true` | Require the selected device runtime to use deterministic algorithms |
 | `TORCH_TURBO_SP_SIZE=2` | Set the sequence-parallel size |
 | `TORCH_TURBO_EP_SIZE=8` | Set the expert-parallel size |
+| `TORCH_TURBO_MOE_TOKEN_DISPATCHER=moon` | Select the MoE token dispatcher: `alltoall` (default) or `moon` |
 | `TORCH_TURBO_GBS=64` | Set the global batch size in micro-batch units; the engine derives gradient accumulation from GBS, SP size, and world size |
 | `TORCH_TURBO_RESHARD_AFTER_FWD=0` | Control whether parameters are resharded after the forward pass |
 | `TORCH_TURBO_PREFETCH_STRATEGY=auto` | Set the FSDP prefetch topology: `native`, `auto` (default), `expert_lookahead`, or `expert_with_layer` |
@@ -347,6 +377,7 @@ Most environment variables have corresponding higher-priority `--tt_*` CLI argum
 | --- | --- |
 | Basic configuration | `--tt_config` / `--tt_backend` / `--tt_mixed_precision` / `--tt_op_policy` / `--tt_use_deterministic_algorithms` |
 | Parallelism | `--tt_sp_size` / `--tt_ep_size` |
+| MoE token dispatch | `--tt_moe_token_dispatcher` (`alltoall` or `moon`) |
 | Batch size | `--tt_gbs` |
 | Memory | `--tt_gradient_checkpointing` / `--tt_ac_use_reentrant` / `--tt_cpu_offload` |
 | Prefetching | `--tt_prefetch_strategy` / `--tt_prefetch_direction` / `--tt_forward_prefetch_depth` / `--tt_backward_prefetch_depth` |

@@ -524,8 +524,8 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         env_name="TORCH_TURBO_MOE_TOKEN_DISPATCHER",
         config_path="moe.token_dispatcher",
         type=str,
-        choices=("alltoall",),
-        help="Expert token dispatcher type: alltoall.",
+        choices=("alltoall", "moon"),
+        help="Expert token dispatcher type: alltoall (default) or moon.",
     ),
     TurboArgSpec(
         name="moe_aux_loss_coeff",

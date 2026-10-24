@@ -184,6 +184,8 @@ class GroupedMLPLoRA(nn.Module, BaseTunerLayer):
         nn.Module.__init__(self)
 
         # Validate unsupported features early.
+        if base_layer.config.moe_token_dispatcher_type == "moon":
+            raise ValueError("Moon EP does not support expert LoRA.")
         if use_dora:
             raise ValueError(
                 "GroupedMLPLoRA does not support DoRA (use_dora=True)."
