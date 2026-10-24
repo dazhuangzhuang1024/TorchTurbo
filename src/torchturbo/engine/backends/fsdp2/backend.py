@@ -60,8 +60,10 @@ if torch_version() >= (2, 6, 0):
         FSDPModule,
         register_fsdp_forward_method,
     )
+    from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
 else:  # pragma: no cover - torch<2.6 compatibility
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+    from torch.distributed._composable.fsdp._fsdp_common import TrainingState
 
     try:  # pragma: no cover - torch<2.6 compatibility
         from torch.distributed._composable.fsdp.fully_shard import (
@@ -884,6 +886,17 @@ class FSDP2Backend(BaseBackend):
                 def run_fn(*a, **kw):
                     if torch.is_grad_enabled():
                         with suspend_prefetch(model):
+                            # Reentrant replay builds a fresh graph. Nested FSDP
+                            # can retain PRE_BACKWARD from an earlier replay in
+                            # this outer backward, which skips registering this
+                            # graph's reduction hooks. Re-enter its normal
+                            # forward hooks so each replay gets its own hooks.
+                            for child in module.modules():
+                                if child is module or not isinstance(child, FSDPModule):
+                                    continue
+                                state = child._get_fsdp_state()
+                                if state._training_state == TrainingState.PRE_BACKWARD:
+                                    state._training_state = TrainingState.IDLE
                             return base_fn(*a, **kw)
                     return base_fn(*a, **kw)
 
