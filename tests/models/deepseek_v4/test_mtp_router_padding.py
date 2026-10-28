@@ -1,6 +1,8 @@
 """Standard MTP masks shifted padding before router losses and statistics."""
 
+import copy
 import importlib
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+from torchturbo.engine.config import EngineConfig
 from torchturbo.models.deepseek_v4 import mtp
 from torchturbo.models.modules.moe.experts import GroupedMLP
 from torchturbo.models.modules.moe.module import ModuleSpec
@@ -15,6 +19,7 @@ from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
 from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.ops import OpPolicy, get_or_create_ops
+from torchturbo.parallel import FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
 
 
@@ -50,6 +55,61 @@ class RouterMTPStage(torch.nn.Module):
                 self.ffn, inputs_embeds, use_reentrant=self.checkpoint_mode,
             )
         return hidden_states, outputs
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+@pytest.mark.parametrize("checkpoint_target", ["0", "0.ffn"])
+@pytest.mark.parametrize("aux_coeff,z_coeff", [(0.2, 0.0), (0.0, 0.3), (0.2, 0.3)])
+def test_checkpoint_preserves_mtp_padding_for_each_forward(
+    use_reentrant, checkpoint_target, aux_coeff, z_coeff,
+):
+    torch.manual_seed(17)
+    config = MoEConfig(
+        hidden_size=4, moe_ffn_hidden_size=3, num_moe_experts=3,
+        moe_router_topk=2, moe_router_dtype="fp32", moe_router_score_function="sigmoid",
+        moe_router_enable_expert_bias=True,
+        moe_aux_loss_coeff=aux_coeff, moe_z_loss_coeff=z_coeff,
+        gated_linear_unit=True, activation_func=F.silu,
+    )
+    reference = SimpleNamespace(
+        mtp=torch.nn.ModuleList([RouterMTPStage(config, None)]),
+        embed=torch.nn.Embedding(8, 4), head=torch.nn.Identity(), padding_idx=0,
+    )
+    with torch.no_grad():
+        for parameter in reference.mtp.parameters():
+            parameter.normal_(std=0.2)
+    candidate = copy.deepcopy(reference)
+    backend = SimpleNamespace(
+        config=EngineConfig.from_dict({
+            "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
+        }),
+        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+    )
+    FSDP2Backend._apply_activation_checkpointing(
+        backend, candidate.mtp,
+        SimpleNamespace(modules={checkpoint_target: FSDPPlanSpec(activation_checkpoint=True)}),
+    )
+    forwarder = mtp.DeepseekV4MTPForwarder()
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    outputs, expected = [], []
+    for boundaries in ([0, 3, 6], [0, 2, 6]):
+        cu = torch.tensor(boundaries, dtype=torch.int32)
+        outputs += forwarder._mtp_logits(candidate, torch.zeros(1, 6, 4), ids, None, None, cu)
+        expected += forwarder._mtp_logits(reference, torch.zeros(1, 6, 4), ids, None, None, cu)
+    latest_inputs = candidate.mtp[0].ffn._runtime_inputs
+    for actual, ref in zip(outputs, expected):
+        torch.testing.assert_close(actual, ref)
+    sum(output.square().sum() for output in outputs).backward()
+    sum(output.square().sum() for output in expected).backward()
+    for actual, ref in zip(candidate.mtp.parameters(), reference.mtp.parameters()):
+        torch.testing.assert_close(actual.grad, ref.grad)
+    torch.testing.assert_close(candidate.embed.weight.grad, reference.embed.weight.grad)
+    assert candidate.mtp[0].ffn._runtime_inputs is latest_inputs
+    # Each forward contributes its unpadded assignments once, with or without replay.
+    torch.testing.assert_close(
+        candidate.mtp[0].ffn.router.local_tokens_per_expert,
+        reference.mtp[0].ffn.router.local_tokens_per_expert,
+    )
 
 
 @pytest.mark.parametrize("packed", [False, True])

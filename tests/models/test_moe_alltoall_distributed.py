@@ -2,7 +2,6 @@
 
 import os
 import sys
-from contextlib import nullcontext
 from datetime import timedelta
 from itertools import product
 from types import SimpleNamespace
@@ -13,8 +12,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import DTensor
 
 from torchturbo.engine.backends.fsdp2.backend import FSDP2Backend
+from torchturbo.engine.backends.fsdp2.prefetch import FSDPPrefetchManager
 from torchturbo.engine.config import EngineConfig
 from torchturbo.engine.peft.lora import GroupedMLPLoRA
 from torchturbo.models.modules.moe.experts import GroupedMLP
@@ -63,8 +64,8 @@ def _check_moe(
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
     )
+    backend.prefetch_manager = FSDPPrefetchManager(backend.config.backend_config)
     key = "" if boundary == "whole" else "experts"
     target = candidate if boundary == "whole" else candidate.experts
     original_forward = target.forward
@@ -80,6 +81,7 @@ def _check_moe(
     if fsdp_mesh is not None:
         fully_shard(candidate.experts, mesh=fsdp_mesh["edp"])
         fully_shard(candidate, mesh=fsdp_mesh)
+        backend.prefetch_manager.setup(candidate)
 
     is_empty = empty_source == "all" or (empty_source == "one" and rank == 0)
     lengths = [0, 0] if is_empty else [3 + rank, 5 + rank]
@@ -113,9 +115,12 @@ def _check_moe(
         if fsdp_mesh is not None and parameter.requires_grad:
             assert actual_grad is not None, f"{context}, parameter={name}"
             assert ref_grad is not None, f"{context}, parameter={name}"
+            assert isinstance(actual_grad, DTensor), f"{context}, parameter={name}, grad={type(actual_grad)}"
             actual_grad = actual_grad.full_tensor()
-            dist.all_reduce(ref_grad, group=fsdp_mesh["edp"].get_group())
-            ref_grad /= fsdp_mesh["edp"].size()
+            # Experts differ across EP ranks; router weights are shared by all ranks.
+            group = fsdp_mesh["edp"].get_group() if name.startswith("experts.") else dist.group.WORLD
+            dist.all_reduce(ref_grad, group=group)
+            ref_grad /= dist.get_world_size(group)
         torch.testing.assert_close(
             actual_grad, ref_grad,
             msg=lambda message: f"{context}, parameter={name}\n{message}",
@@ -143,7 +148,7 @@ def _run_moe(rank: int, ep_size: int, init_file: str) -> None:
         dist.destroy_process_group()
 
 
-def _run_fsdp_moe(rank: int, world_size: int, init_file: str) -> None:
+def _run_fsdp_moe(rank: int, world_size: int, init_file: str, freeze_inputs: bool) -> None:
     torch.set_num_threads(1)
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo0" if sys.platform == "darwin" else "lo")
     dist.init_process_group(
@@ -155,12 +160,13 @@ def _run_fsdp_moe(rank: int, world_size: int, init_file: str) -> None:
         runtime_module._SELECTED_RUNTIME = runtime
         get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("edp", "ep"))
-        for on_input, empty_source, boundary, use_lora in product(
-            (False, True), ("none", "one", "all"), ("whole", "experts"), (False, True),
+        training_modes = ((True, False), (True, True)) if freeze_inputs else ((False, False), (True, False))
+        for on_input, empty_source, boundary, (use_reentrant, use_lora) in product(
+            (False, True), ("none", "one", "all"), ("whole", "experts"), training_modes,
         ):
             _check_moe(
-                rank, 2, empty_source, boundary, True, on_input,
-                freeze_inputs=True, use_lora=use_lora, fsdp_mesh=mesh,
+                rank, 2, empty_source, boundary, use_reentrant, on_input,
+                freeze_inputs=freeze_inputs, use_lora=use_lora, fsdp_mesh=mesh,
             )
             dist.barrier()
     finally:
@@ -171,9 +177,10 @@ def _run_fsdp_moe(rank: int, world_size: int, init_file: str) -> None:
     not (dist.is_available() and dist.is_gloo_available()),
     reason="requires torch.distributed with Gloo support",
 )
-def test_fsdp_alltoall_reentrant_checkpoint_with_frozen_inputs(tmp_path) -> None:
+@pytest.mark.parametrize("freeze_inputs", [False, True], ids=["full", "frozen"])
+def test_fsdp_alltoall_checkpoint_outputs_and_gradients(tmp_path, freeze_inputs) -> None:
     mp.spawn(
-        _run_fsdp_moe, args=(4, str(tmp_path / "moe-fsdp-ep")), nprocs=4, join=True,
+        _run_fsdp_moe, args=(4, str(tmp_path / "moe-fsdp-ep"), freeze_inputs), nprocs=4, join=True,
     )
 
 

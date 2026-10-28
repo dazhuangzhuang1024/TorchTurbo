@@ -17,7 +17,7 @@ from torchturbo.models.modules.moe import token_dispatcher as dispatch_module
 from torchturbo.models.modules.moe.experts import GroupedMLP
 from torchturbo.models.modules.moe.module import ModuleSpec
 from torchturbo.models.modules.moe.moe_config import MoEConfig
-from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
+from torchturbo.models.modules.moe.moe_layer import MoELayer, MoERuntimeInputs, MoESubmodules
 from torchturbo.ops import OpPolicy, get_or_create_ops
 from torchturbo.parallel import FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
@@ -211,6 +211,64 @@ def test_megatron_weighting_keeps_bf16_tokens_and_fp32_probabilities(monkeypatch
     expected.backward(gradient)
     torch.testing.assert_close(x.grad, ref_x.grad)
     torch.testing.assert_close(layer.router.weight.grad, reference.router.weight.grad)
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_checkpoint_keeps_each_runtime_mask_with_frozen_inputs(use_reentrant):
+    torch.manual_seed(17)
+    reference = _layer(on_input=False)
+    reference.config.moe_z_loss_coeff = 0.3
+    candidate = copy.deepcopy(reference)
+    backend = SimpleNamespace(
+        config=EngineConfig.from_dict({
+            "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
+        }),
+        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+    )
+    FSDP2Backend._apply_activation_checkpointing(
+        backend, candidate, SimpleNamespace(modules={"": FSDPPlanSpec(activation_checkpoint=True)}),
+    )
+    inputs = torch.randn(1, 6, 4)
+    outputs, expected = [], []
+    for padded_index in (2, 1):
+        mask = torch.zeros(1, 6, dtype=torch.bool)
+        mask[:, [padded_index, 5]] = True
+        runtime_inputs = MoERuntimeInputs(padding_mask=mask)
+        candidate.set_runtime_inputs(runtime_inputs)
+        reference.set_runtime_inputs(runtime_inputs)
+        outputs.append(candidate(inputs)[0])
+        expected.append(reference(inputs)[0])
+    sum(output.sum() * 0 for output in outputs).backward()
+    sum(output.sum() * 0 for output in expected).backward()
+    torch.testing.assert_close(candidate.router.weight.grad, reference.router.weight.grad)
+    assert candidate._runtime_inputs is runtime_inputs
+
+
+@pytest.mark.parametrize("fail_exit", [False, True])
+def test_runtime_input_context_restores_each_nested_callers_inputs(fail_exit):
+    from torchturbo.engine.backends.fsdp2.activation_checkpointing import restore_moe_runtime_inputs
+
+    layers = (_layer(on_input=False), _layer(on_input=True))
+    original_inputs = tuple(layer._runtime_inputs for layer in layers)
+    outer_snapshot = tuple((layer, MoERuntimeInputs()) for layer in layers)
+    inner_snapshot = tuple((layer, MoERuntimeInputs()) for layer in reversed(layers))
+
+    with pytest.raises(ValueError, match="outer exit") if fail_exit else nullcontext():
+        with restore_moe_runtime_inputs(outer_snapshot):
+            for layer, inputs in outer_snapshot:
+                assert layer._runtime_inputs is inputs
+            with pytest.raises(RuntimeError, match="inner exit") if fail_exit else nullcontext():
+                with restore_moe_runtime_inputs(inner_snapshot):
+                    for layer, inputs in inner_snapshot:
+                        assert layer._runtime_inputs is inputs
+                    if fail_exit:
+                        raise RuntimeError("inner exit")
+            for layer, inputs in outer_snapshot:
+                assert layer._runtime_inputs is inputs
+            if fail_exit:
+                raise ValueError("outer exit")
+    for layer, inputs in zip(layers, original_inputs, strict=True):
+        assert layer._runtime_inputs is inputs
 
 
 @pytest.mark.parametrize("use_lora", [False, True])

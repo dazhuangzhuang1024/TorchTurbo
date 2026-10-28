@@ -31,6 +31,8 @@ class MoESubmodules:
 @dataclass
 class MoERuntimeInputs:
     padding_mask: torch.Tensor | None = None
+    # False while recomputation replays a forward that already counted its tokens.
+    accumulate_tokens_per_expert: bool = True
 
 
 class BaseMoELayer(torch.nn.Module, ABC):
@@ -149,7 +151,8 @@ class MoELayer(BaseMoELayer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route tokens, compute local experts, and combine their outputs."""
         routing, logits = self.router(
-            hidden_states, input_ids, self._runtime_inputs.padding_mask
+            hidden_states, input_ids, self._runtime_inputs.padding_mask,
+            self._runtime_inputs.accumulate_tokens_per_expert,
         )
         logits = logits.view(-1, logits.shape[-1])
 

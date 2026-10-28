@@ -249,6 +249,7 @@ class TopKRouter(Router):
         logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
+        accumulate_tokens_per_expert: bool = True,
     ) -> RoutingResult:
         """Top-k routing function
 
@@ -302,8 +303,13 @@ class TopKRouter(Router):
                 probs=self._apply_aux_loss(routing.probs, aux_scores, aux_routing_map),
             )
 
-        # Prevent extra local tokens accumulation on evaluation or activation recomputation
-        if self.enable_expert_bias and torch.is_grad_enabled():
+        # Count each training forward once. Evaluation and the reentrant first
+        # pass run without grad; non-reentrant recomputation disables counting.
+        if (
+            self.enable_expert_bias
+            and accumulate_tokens_per_expert
+            and torch.is_grad_enabled()
+        ):
             with torch.no_grad():
                 bias_routing_map = mask_padding_tokens(
                     routing.routing_map, padding_mask
@@ -324,6 +330,7 @@ class TopKRouter(Router):
         input: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
+        accumulate_tokens_per_expert: bool = True,
     ) -> tuple[RoutingResult, torch.Tensor]:
         """
         Forward pass of the router.
@@ -335,6 +342,8 @@ class TopKRouter(Router):
 
         logits = self.gating(input)
 
-        routing = self.routing(logits, input_ids, padding_mask)
+        routing = self.routing(
+            logits, input_ids, padding_mask, accumulate_tokens_per_expert
+        )
 
         return routing, logits
