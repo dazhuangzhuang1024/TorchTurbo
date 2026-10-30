@@ -23,6 +23,42 @@ from .moe_utils import (
 from .utils import RoutingResult, topk_softmax_with_capacity
 
 
+class RouterGatingLinearFunction(torch.autograd.Function):
+    """Compute router logits in the router dtype.
+
+    Only the original input and weight are saved; backward recreates the casts,
+    so autograd does not keep router-dtype copies of the activations.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, input: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input, weight)
+        ctx.router_dtype = router_dtype
+        # Autocast must not override the router's compute dtype.
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            return torch.nn.functional.linear(
+                input.to(router_dtype), weight.to(router_dtype)
+            )
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        input, weight = ctx.saved_tensors
+        grad_output = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_input = None
+        grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.mm(weight.to(ctx.router_dtype))
+            grad_input = grad_input.view(input.shape).to(input.dtype)
+        if ctx.needs_input_grad[1]:
+            flat_input = input.reshape(-1, input.shape[-1]).to(ctx.router_dtype)
+            grad_weight = grad_output.t().mm(flat_input).to(weight.dtype)
+        return grad_input, grad_weight, None
+
+
 class Router(ABC, torch.nn.Module):
     """Base Router class"""
 
@@ -63,12 +99,7 @@ class Router(ABC, torch.nn.Module):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == "fp64":
             router_dtype = torch.float64
-        # Autocast must not override the router's compute dtype.
-        with torch.autocast(device_type=input.device.type, enabled=False):
-            logits = torch.nn.functional.linear(
-                input.to(router_dtype), self.weight.to(router_dtype)
-            )
-        return logits
+        return RouterGatingLinearFunction.apply(input, self.weight, router_dtype)
 
 
 class TopKRouter(Router):

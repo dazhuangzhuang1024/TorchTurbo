@@ -43,6 +43,26 @@ def test_gating_preserves_compute_dtype_and_gradients_under_autocast(device, inp
     torch.testing.assert_close(router.weight.grad, ref_weight.grad, rtol=0, atol=0)
 
 
+def test_gating_saves_inputs_without_router_dtype_copies():
+    router = TopKRouter(MoEConfig(
+        hidden_size=4, num_moe_experts=3, moe_router_dtype="fp32",
+        params_dtype=torch.bfloat16,
+    ))
+    inputs = torch.randn(2, 3, 4, dtype=torch.bfloat16, requires_grad=True)
+    saved = []
+
+    def save(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(save, lambda tensor: tensor):
+        logits = router.gating(inputs)
+    assert logits.dtype == torch.float32
+    assert [(tuple(tensor.shape), tensor.dtype) for tensor in saved] == [
+        ((2, 3, 4), torch.bfloat16), ((3, 4), torch.bfloat16),
+    ]
+
+
 def test_softmax_expert_bias_requires_pre_softmax():
     with pytest.raises(ValueError, match="moe_router_pre_softmax=True"):
         MoEConfig(num_moe_experts=4, moe_router_enable_expert_bias=True)
