@@ -91,6 +91,25 @@ def _build_muon_buckets(
 
 
 @dataclass(frozen=True, slots=True)
+class MatrixRegion:
+    """Storage coordinates and shape of one independent Muon matrix."""
+
+    matrix_index: int
+    global_row_offset: int
+    global_column_offset: int
+    num_rows: int
+    num_columns: int
+
+    @property
+    def numel(self) -> int:
+        return self.num_rows * self.num_columns
+
+    @property
+    def tensor_shape(self) -> torch.Size:
+        return torch.Size((self.num_rows, self.num_columns))
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedBatchedMatrixView:
     """Resolved storage-order batch and Muon logical-matrix interpretation."""
 
@@ -98,6 +117,32 @@ class ResolvedBatchedMatrixView:
     matrix_rows: int
     storage_columns: int
     column_groups: int = 1
+
+    @property
+    def storage_shape(self) -> torch.Size:
+        return torch.Size((self.batch_size * self.matrix_rows, self.storage_columns))
+
+    @property
+    def matrices(self) -> tuple[MatrixRegion, ...]:
+        if (
+            self.batch_size <= 0
+            or self.matrix_rows <= 0
+            or self.storage_columns <= 0
+            or self.column_groups <= 0
+            or self.storage_columns % self.column_groups
+        ):
+            raise ValueError("batched compute view does not match its storage")
+        return tuple(
+            MatrixRegion(
+                batch * self.column_groups + group,
+                batch * self.matrix_rows,
+                group * self.matrix_columns,
+                self.matrix_rows,
+                self.matrix_columns,
+            )
+            for batch in range(self.batch_size)
+            for group in range(self.column_groups)
+        )
 
     @property
     def matrix_columns(self) -> int:
@@ -177,9 +222,82 @@ class ResolvedBatchedMatrixView:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedRowSplitMatrixView:
+    """Repeated storage row blocks split into independently updated matrices."""
+
+    batch_size: int
+    row_sizes: tuple[int, ...]
+    storage_columns: int
+
+    @property
+    def storage_shape(self) -> torch.Size:
+        return torch.Size((self.batch_size * sum(self.row_sizes), self.storage_columns))
+
+    @property
+    def global_compute_shape(self) -> torch.Size:
+        return self.storage_shape
+
+    @property
+    def matrices(self) -> tuple[MatrixRegion, ...]:
+        matrices = []
+        row_offset = 0
+        for _ in range(self.batch_size):
+            for rows in self.row_sizes:
+                matrices.append(
+                    MatrixRegion(
+                        len(matrices), row_offset, 0, rows, self.storage_columns
+                    )
+                )
+                row_offset += rows
+        return tuple(matrices)
+
+    @property
+    def signature(self) -> tuple[object, ...]:
+        return ("row_split", self.batch_size, self.row_sizes, self.storage_columns)
+
+
+ResolvedMatrixView = ResolvedBatchedMatrixView | ResolvedRowSplitMatrixView
+
+
 @runtime_checkable
 class MatrixComputeView(Protocol):
-    def resolve(self, storage_shape: torch.Size) -> ResolvedBatchedMatrixView: ...
+    def resolve(self, storage_shape: torch.Size) -> ResolvedMatrixView: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RowSplitComputeView:
+    """Split each of ``batch_size`` row blocks into matrices of ``row_sizes``.
+
+    Each matrix spans all storage columns. MLA up projections use one block
+    per head; the shared KV down projection uses a single block.
+    """
+
+    batch_size: int
+    row_sizes: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.batch_size) is not int or self.batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        if not self.row_sizes or any(
+            type(size) is not int or size <= 0 for size in self.row_sizes
+        ):
+            raise ValueError("row_sizes must contain positive integers")
+        object.__setattr__(self, "row_sizes", tuple(self.row_sizes))
+
+    def resolve(self, storage_shape: torch.Size) -> ResolvedRowSplitMatrixView:
+        if (
+            len(storage_shape) != 2
+            or storage_shape[0] != self.batch_size * sum(self.row_sizes)
+            or storage_shape[1] <= 0
+        ):
+            raise ValueError(
+                f"storage shape {tuple(storage_shape)} cannot be split into "
+                f"{self.batch_size} row blocks of {self.row_sizes}"
+            )
+        return ResolvedRowSplitMatrixView(
+            self.batch_size, self.row_sizes, storage_shape[1]
+        )
 
 
 @dataclass(frozen=True, slots=True)

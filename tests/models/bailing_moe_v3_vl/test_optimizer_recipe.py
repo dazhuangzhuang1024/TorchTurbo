@@ -12,6 +12,7 @@ from torchturbo.engine.optimizers import (
     ExpertUpComputeView,
     MuonPlan,
     Owned,
+    RowSplitComputeView,
 )
 from torchturbo.models.bailing_moe_v3_vl.model import (
     TurboBailingMoeV3VLForConditionalGeneration,
@@ -47,6 +48,16 @@ def _assert_per_head(plan, model, fqn, matrix_shape):
     assert resolved.matrix_shape == matrix_shape
 
 
+def _assert_row_split(plan, model, fqn, batch_size, rows, columns):
+    spec = plan.parameter_specs[fqn]
+    assert spec.compute_placement == Shard(0)
+    assert spec.compute_view == RowSplitComputeView(batch_size, rows)
+    resolved = spec.compute_view.resolve(model.get_parameter(fqn).shape)
+    assert [matrix.tensor_shape for matrix in resolved.matrices] == [
+        (size, columns) for _ in range(batch_size) for size in rows
+    ]
+
+
 @pytest.mark.parametrize("q_lora_rank", [None, 4])
 @pytest.mark.parametrize("gate_type", [None, "head_wise", "element_wise"])
 @pytest.mark.parametrize("no_kda_lora", [False, True])
@@ -58,6 +69,7 @@ def test_hybrid_muon_plan_resolves_configured_attention_and_mtp(
     text.num_attention_heads = 4
     text.num_key_value_heads = 4
     text.v_head_dim = 6
+    text.kv_lora_rank = 10
     text.q_lora_rank = q_lora_rank
     text.gated_attention_proj_granularity_type = gate_type
     text.no_kda_lora = no_kda_lora
@@ -69,10 +81,13 @@ def test_hybrid_muon_plan_resolves_configured_attention_and_mtp(
     query_columns = text.hidden_size if q_lora_rank is None else q_lora_rank
     for index in (1, 2):
         attention = f"model.layers.{index}.attention"
-        _assert_per_head(
-            plan, model, f"{attention}.{query}.weight", (12, query_columns)
+        _assert_row_split(
+            plan, model, f"{attention}.{query}.weight", 4, (4, 8), query_columns
         )
-        _assert_per_head(plan, model, f"{attention}.kv_b_proj.weight", (10, 8))
+        _assert_row_split(plan, model, f"{attention}.kv_b_proj.weight", 4, (4, 6), 10)
+        _assert_row_split(
+            plan, model, f"{attention}.kv_a_proj_with_mqa.weight", 1, (10, 8), 16
+        )
         gate_fqn = f"{attention}.g_proj.weight"
         if gate_type == "head_wise":
             assert gate_fqn in adamw_fqns
@@ -80,9 +95,7 @@ def test_hybrid_muon_plan_resolves_configured_attention_and_mtp(
             _assert_per_head(plan, model, gate_fqn, (6, 16))
         else:
             assert gate_fqn not in dict(model.named_parameters())
-        for projection in ("kv_a_proj_with_mqa", "dense"):
-            spec = plan.parameter_specs[f"{attention}.{projection}.weight"]
-            assert spec.compute_placement == Owned()
+        assert plan.parameter_specs[f"{attention}.dense.weight"].compute_placement == Owned()
         if q_lora_rank is not None:
             spec = plan.parameter_specs[f"{attention}.q_a_proj.weight"]
             assert spec.compute_placement == Owned()

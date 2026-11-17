@@ -29,12 +29,14 @@ from .....utils.torch_utils import torch_version
 from ....optimizers.muon import (
     MuonPlan,
     Owned,
-    ResolvedBatchedMatrixView,
+    ResolvedMatrixView,
+    ResolvedRowSplitMatrixView,
 )
 from ....optimizers.plan import ParamGroup
 from ..config import CPUOffloadConfig, CPUOffloadMode
 from .adamw import prepare_fsdp_adamw_optimizer
 from .muon_layout import (
+    _MatrixComputeGroup,
     _MatrixRoute,
     _MuonLayoutPlanner,
     _MuonParameterLayout,
@@ -177,10 +179,11 @@ class _BoundMuonParameter:
     group_index: int
     compute_placement: Owned | Shard
     global_compute_shape: torch.Size
-    resolved_compute_view: ResolvedBatchedMatrixView | None
+    resolved_compute_view: ResolvedMatrixView | None
     compute_view_key: tuple[Any, ...]
     storage_layout: _FSDPStorageLayout
     local_storage_identity: _LocalStorageIdentity
+    local_update_regions: tuple[tuple[slice, torch.Size], ...] = ()
 
 
 @dataclass(slots=True, init=False)
@@ -325,6 +328,8 @@ class _CompiledMuonBucket:
     items: tuple[_BoundMuonParameter, ...]
     local_items: tuple[_BoundMuonParameter, ...]
     local_item_compute_shapes: tuple[torch.Size, ...]
+    local_item_compute_groups: tuple[tuple[_MatrixComputeGroup, ...], ...]
+    local_item_routes: tuple[tuple[_MatrixRoute, ...], ...]
     redistributed_items: tuple[_BoundMuonParameter, ...]
     redistributed_plans: tuple[_StorageToComputePlan, ...]
     group: _MuonCommGroup | None
@@ -359,7 +364,7 @@ class _CompiledMuonBucket:
             for item, plan, parameter_group in zip(
                 items, parameter_plans, parameter_groups, strict=True
             )
-            if not plan.requires_redistribution
+            if not plan.has_remote_transfers
         )
         redistributed_entries = tuple(
             (item, plan, parameter_group)
@@ -369,11 +374,22 @@ class _CompiledMuonBucket:
                 parameter_groups,
                 strict=True,
             )
-            if plan.requires_redistribution
+            if plan.has_remote_transfers
         )
         local_items = tuple(item for item, _plan, _group in local_entries)
         local_item_compute_shapes = tuple(
             plan.compute_partition(parameter_group.current_group_rank).tensor_shape
+            for _item, plan, parameter_group in local_entries
+        )
+        local_item_compute_groups = tuple(
+            plan.compute_partition(parameter_group.current_group_rank).matrix_groups
+            for _item, plan, parameter_group in local_entries
+        )
+        local_item_routes = tuple(
+            tuple(
+                route for route in plan.storage_to_compute_routes
+                if route.source_group_rank == parameter_group.current_group_rank
+            )
             for _item, plan, parameter_group in local_entries
         )
         # Without an explicit execution device, Muon runs where shards live.
@@ -389,6 +405,8 @@ class _CompiledMuonBucket:
                 items=items,
                 local_items=local_items,
                 local_item_compute_shapes=local_item_compute_shapes,
+                local_item_compute_groups=local_item_compute_groups,
+                local_item_routes=local_item_routes,
                 redistributed_items=(),
                 redistributed_plans=(),
                 group=None,
@@ -462,6 +480,8 @@ class _CompiledMuonBucket:
             items=items,
             local_items=local_items,
             local_item_compute_shapes=local_item_compute_shapes,
+            local_item_compute_groups=local_item_compute_groups,
+            local_item_routes=local_item_routes,
             redistributed_items=redistributed_items,
             redistributed_plans=redistributed_plans,
             group=group,
@@ -801,16 +821,19 @@ class _MuonWorkspace:
         bucket: _CompiledMuonBucket,
         capacities: dict[_BufferKey, dict[str, int]],
     ) -> None:
-        for item, shape in zip(
+        for item, shape, routes in zip(
             bucket.local_items,
             bucket.local_item_compute_shapes,
+            bucket.local_item_routes,
             strict=True,
         ):
             key = (bucket.device, item.storage_layout.dtype)
             required = capacities.setdefault(key, {})
             required["compute_scratch_numel"] = max(
                 required.get("compute_scratch_numel", 0),
-                math.prod(shape),
+                math.prod(shape) + (
+                    item.storage_layout.local_shape.numel() if routes else 0
+                ),
             )
 
         if not bucket.has_redistribution:
@@ -1007,11 +1030,18 @@ class _MuonWorkspace:
         max_staging = 0
         max_compute = 0
         for bucket in buckets:
-            shapes = list(bucket.local_item_compute_shapes)
+            shapes = [
+                group.tensor_shape
+                for groups in bucket.local_item_compute_groups
+                for group in groups
+            ]
             if bucket.group is not None:
                 shapes.extend(
-                    plan.compute_partition(bucket.group.current_group_rank).tensor_shape
+                    group.tensor_shape
                     for plan in bucket.redistributed_plans
+                    for group in plan.compute_partition(
+                        bucket.group.current_group_rank
+                    ).matrix_groups
                 )
             for shape in shapes:
                 rows, columns = shape[-2:]
@@ -1473,6 +1503,24 @@ class FSDPDistributedMuon(Optimizer):
                         f"Muon parameter {fqn!r} has an unsupported compute placement"
                     )
 
+                local_update_regions = []
+                if isinstance(resolved_view, ResolvedRowSplitMatrixView):
+                    # Storage follows mesh coordinates, not sorted group ranks.
+                    _, row_offset = Shard.local_shard_size_and_offset(
+                        param.shape[0], param.device_mesh.size(),
+                        param.device_mesh.get_coordinate()[0],
+                    )
+                    for matrix in resolved_view.matrices:
+                        start = max(matrix.global_row_offset - row_offset, 0)
+                        end = min(
+                            matrix.global_row_offset + matrix.num_rows - row_offset,
+                            local_tensor.shape[0],
+                        )
+                        if start < end:
+                            local_update_regions.append(
+                                (slice(start, end), matrix.tensor_shape)
+                            )
+
                 bound_parameters.append(
                     _BoundMuonParameter(
                         fqn=fqn,
@@ -1484,6 +1532,7 @@ class FSDPDistributedMuon(Optimizer):
                         compute_view_key=compute_view_key,
                         storage_layout=storage_layout,
                         local_storage_identity=local_storage_identity,
+                        local_update_regions=tuple(local_update_regions),
                     )
                 )
 
@@ -1610,7 +1659,7 @@ class FSDPDistributedMuon(Optimizer):
         """Compile logical bucket definitions into execution-ready buckets.
 
         Assign all logical matrices before resolving storage-to-compute plans.
-        Identity mappings remain local; other items share packed schedules.
+        Rank-local mappings use scratch; remote transfers share packed schedules.
         This stage only builds metadata and does not execute collectives.
         """
         # Resolve bucket FQNs and require every bound parameter exactly once.
@@ -2072,20 +2121,12 @@ class FSDPDistributedMuon(Optimizer):
         direction = result.transpose(-2, -1) if transposed else result
         compute.copy_(direction)
 
-    def _apply_update(self, item: _BoundMuonParameter, direction: Tensor) -> None:
-        """Apply weight decay and a computed direction to local parameter data."""
+    def _matrix_lr_scale(
+        self, item: _BoundMuonParameter, shape: Sequence[int]
+    ) -> float:
+        """Return the learning-rate coefficient for one logical matrix."""
         group = self._group(item)
-        local_param = item.param.to_local().view_as(direction)
-        stored_param = local_param
-        local_param = local_param.to(direction.device)
-        if item.resolved_compute_view is not None:
-            matrix_shape = item.resolved_compute_view.matrix_shape
-        else:
-            matrix_shape = item.global_compute_shape
-
-        # The direction step is shape-adjusted; decoupled weight decay continues
-        # to use the configured base learning rate.
-        rows, columns = matrix_shape[-2:]
+        rows, columns = shape[-2:]
         adjust_lr_fn = group["adjust_lr_fn"]
         if adjust_lr_fn is None or adjust_lr_fn == "original":
             ratio = math.sqrt(max(1.0, rows / columns))
@@ -2095,10 +2136,42 @@ class FSDPDistributedMuon(Optimizer):
             ratio = math.sqrt(rows / columns)
         else:
             raise ValueError(f"unsupported adjust_lr_fn {adjust_lr_fn!r}")
-        adjusted_lr = group["lr"] * ratio
+        return ratio
+
+    def _compute_partition_update(
+        self,
+        item: _BoundMuonParameter,
+        compute: Tensor,
+        groups: tuple[_MatrixComputeGroup, ...],
+    ) -> None:
+        """Update each homogeneous matrix batch inside a packed partition."""
+        flat = compute.view(-1)
+        for group in groups:
+            matrices = flat.narrow(
+                0, group.flat_offset, group.tensor_shape.numel()
+            ).view(group.tensor_shape)
+            self._compute_update(item, matrices)
+
+    def _apply_update(self, item: _BoundMuonParameter, direction: Tensor) -> None:
+        """Apply one decay and the restored matrix directions to local storage."""
+        group = self._group(item)
+        local_param = item.param.to_local()
+        direction = direction.view_as(local_param)
+        stored_param = local_param
+        local_param = local_param.to(direction.device)
 
         local_param.mul_(1 - group["lr"] * group["weight_decay"])
-        local_param.add_(direction, alpha=-adjusted_lr)
+        view = item.resolved_compute_view
+        # Combine the shape coefficient and LR at the parameter update so BF16
+        # directions do not acquire an extra rounding before the final add.
+        if isinstance(view, ResolvedRowSplitMatrixView):
+            for rows, shape in item.local_update_regions:
+                adjusted_lr = group["lr"] * self._matrix_lr_scale(item, shape)
+                local_param[rows].add_(direction[rows], alpha=-adjusted_lr)
+        else:
+            shape = item.global_compute_shape if view is None else view.matrix_shape
+            adjusted_lr = group["lr"] * self._matrix_lr_scale(item, shape)
+            local_param.add_(direction, alpha=-adjusted_lr)
         if stored_param.device != local_param.device:
             stored_param.copy_(local_param)
         torch.autograd.graph.increment_version(item.param)
@@ -2109,20 +2182,48 @@ class FSDPDistributedMuon(Optimizer):
         buffers: _MuonBuffers,
     ) -> None:
         """Prepare, compute, and apply local items using shared scratch space."""
-        for item, shape in zip(
+        for item, shape, groups, routes in zip(
             bucket.local_items,
             bucket.local_item_compute_shapes,
+            bucket.local_item_compute_groups,
+            bucket.local_item_routes,
             strict=True,
         ):
-            prepared = buffers.compute_tensor(
-                shape,
+            numel = shape.numel()
+            storage_numel = item.storage_layout.local_shape.numel() if routes else 0
+            scratch = buffers.compute_tensor(
+                torch.Size((numel + storage_numel,)),
                 dtype=item.storage_layout.dtype,
                 device=bucket.device,
             )
-            self._prepare_local(item, prepared)
+            prepared = scratch[:numel].view(shape)
+            # The transfer stream may be preparing remote items concurrently.
+            # Keep both sides of local packing in compute-stream scratch.
+            storage = (
+                scratch[numel:].view(item.storage_layout.local_shape)
+                if routes else prepared
+            )
+            self._prepare_local(item, storage)
+            # Pack without shared communication buffers so each local item
+            # retains its own dtype and process group.
+            views = []
+            for route in routes:
+                rectangle = (route.num_rows, route.num_columns)
+                source = storage.as_strided(
+                    rectangle, (route.source_row_stride, 1),
+                    storage.storage_offset() + route.source_flat_offset,
+                )
+                destination = prepared.as_strided(
+                    rectangle, (route.destination_row_stride, 1),
+                    prepared.storage_offset() + route.destination_flat_offset,
+                )
+                destination.copy_(source)
+                views.append((source, destination))
             if math.prod(shape):
-                self._compute_update(item, prepared)
-            self._apply_update(item, prepared)
+                self._compute_partition_update(item, prepared, groups)
+            for source, destination in views:
+                source.copy_(destination)
+            self._apply_update(item, storage)
 
     def _prepare_redistributed(
         self,
@@ -2170,7 +2271,8 @@ class FSDPDistributedMuon(Optimizer):
                 strict=True,
             )
         ):
-            shape = plan.compute_partition(rank).tensor_shape
+            partition = plan.compute_partition(rank)
+            shape = partition.tensor_shape
             if not math.prod(shape):
                 continue
             compute = buffers.compute_tensor(
@@ -2182,7 +2284,7 @@ class FSDPDistributedMuon(Optimizer):
                 span.tensor_view(compute).copy_(
                     span.buffer_view(compute_buffer)
                 )
-            self._compute_update(item, compute)
+            self._compute_partition_update(item, compute, partition.matrix_groups)
             for span in bucket.reverse.input_spans_by_parameter[index]:
                 span.buffer_view(compute_buffer).copy_(
                     span.tensor_view(compute)

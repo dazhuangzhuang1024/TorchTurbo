@@ -162,9 +162,10 @@ def test_bailing_recipe_selects_only_mla_and_configured_query(q_lora_rank):
         BailingMoeV3MultiLatentAttention,
     )
     from torchturbo.models.bailing_hybrid.optimizer_recipe import get_muon_recipe
+    from torchturbo.engine.optimizers import RowSplitComputeView
 
     config = SimpleNamespace(
-        q_lora_rank=q_lora_rank, num_attention_heads=2,
+        q_lora_rank=q_lora_rank, kv_lora_rank=3, num_attention_heads=2,
         qk_nope_head_dim=2, qk_rope_head_dim=1, v_head_dim=2,
     )
     # The recipe reads module types without running attention kernels.
@@ -185,6 +186,16 @@ def test_bailing_recipe_selects_only_mla_and_configured_query(q_lora_rank):
     assert all(spec.query_projection == query for spec in recipe.qk_clip_specs.values())
     assert f"model.layers.0.attention.{query}.weight" in recipe.parameter_overrides
     assert "model.layers.1.attention.q_proj.weight" in recipe.parameter_overrides
+    for layer in (0, 2):
+        prefix = f"model.layers.{layer}.attention"
+        expected = {
+            query: (2, (2, 1)),
+            "kv_b_proj": (2, (2, 2)),
+            "kv_a_proj_with_mqa": (1, (3, 1)),
+        }
+        for projection, (batch_size, row_sizes) in expected.items():
+            spec = recipe.parameter_overrides[f"{prefix}.{projection}.weight"]
+            assert spec.compute_view == RowSplitComputeView(batch_size, row_sizes)
 
 
 @pytest.mark.parametrize("fallback", [False, True])

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import torch
 from torch.distributed.tensor import Shard
 
-from ....optimizers.muon import ResolvedBatchedMatrixView
+from ....optimizers.muon import MatrixRegion, ResolvedMatrixView
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,42 +31,32 @@ class _RowPartition:
 
 
 @dataclass(frozen=True, slots=True)
-class _MuonMatrix:
-    """One independent Muon matrix within global parameter storage."""
-
-    matrix_index: int
-    global_row_offset: int
-    global_column_offset: int
-    num_rows: int
-    num_columns: int
-
-    @property
-    def numel(self) -> int:
-        return self.num_rows * self.num_columns
-
-    @property
-    def tensor_shape(self) -> torch.Size:
-        return torch.Size((self.num_rows, self.num_columns))
-
-
-@dataclass(frozen=True, slots=True)
 class _MuonParameterLayout:
     """Persistent storage and logical matrices before owner assignment."""
 
     fqn: str
     global_storage_shape: torch.Size
     storage_partitions: tuple[_RowPartition, ...]
-    matrices: tuple[_MuonMatrix, ...]
+    matrices: tuple[MatrixRegion, ...]
     is_batched: bool
 
 
 @dataclass(frozen=True, slots=True)
+class _MatrixComputeGroup:
+    """Same-shaped independent matrices in a contiguous compute-buffer span."""
+
+    flat_offset: int
+    tensor_shape: torch.Size
+
+
+@dataclass(frozen=True, slots=True)
 class _MatrixPartition:
-    """Complete matrices packed in matrix-index order on one group rank."""
+    """Complete matrices packed by shape, then matrix index, on one rank."""
 
     group_rank: int
     matrix_indices: tuple[int, ...]
     tensor_shape: torch.Size
+    matrix_groups: tuple[_MatrixComputeGroup, ...] = ()
 
     @property
     def numel(self) -> int:
@@ -116,7 +106,7 @@ class _StorageToComputePlan:
 
     storage_partitions: tuple[_RowPartition, ...]
     compute_partitions: tuple[_MatrixPartition, ...]
-    matrices: tuple[_MuonMatrix, ...]
+    matrices: tuple[MatrixRegion, ...]
     storage_to_compute_routes: tuple[_MatrixRoute, ...]
     compute_to_storage_routes: tuple[_MatrixRoute, ...] = field(init=False)
 
@@ -130,6 +120,13 @@ class _StorageToComputePlan:
     @property
     def requires_redistribution(self) -> bool:
         return bool(self.storage_to_compute_routes)
+
+    @property
+    def has_remote_transfers(self) -> bool:
+        return any(
+            route.source_group_rank != route.destination_group_rank
+            for route in self.storage_to_compute_routes
+        )
 
     def storage_partition(self, group_rank: int) -> _RowPartition:
         """Return one group rank's persistent storage partition."""
@@ -162,7 +159,7 @@ class _MuonLayoutPlanner:
         fqn: str,
         global_storage_shape: torch.Size,
         local_storage_shape: torch.Size,
-        compute_view: ResolvedBatchedMatrixView | None = None,
+        compute_view: ResolvedMatrixView | None = None,
     ) -> _MuonParameterLayout:
         """Resolve storage and independent matrices without choosing owners."""
         if len(global_storage_shape) != 2 or any(
@@ -175,35 +172,13 @@ class _MuonLayoutPlanner:
             fqn, global_storage_shape, local_storage_shape, storage
         )
         if compute_view is None:
-            matrices = (_MuonMatrix(0, 0, 0, *global_storage_shape),)
+            matrices = (MatrixRegion(0, 0, 0, *global_storage_shape),)
         else:
-            view_storage_shape = torch.Size(
-                (
-                    compute_view.batch_size * compute_view.matrix_rows,
-                    compute_view.storage_columns,
-                )
-            )
-            if (
-                view_storage_shape != global_storage_shape
-                or compute_view.batch_size <= 0
-                or compute_view.matrix_rows <= 0
-                or compute_view.column_groups <= 0
-                or compute_view.storage_columns % compute_view.column_groups
-            ):
+            if compute_view.storage_shape != global_storage_shape:
                 raise ValueError(
                     f"Muon parameter {fqn!r} compute view does not match its storage"
                 )
-            matrices = tuple(
-                _MuonMatrix(
-                    matrix_index=batch_index * compute_view.column_groups + group_index,
-                    global_row_offset=batch_index * compute_view.matrix_rows,
-                    global_column_offset=group_index * compute_view.matrix_columns,
-                    num_rows=compute_view.matrix_rows,
-                    num_columns=compute_view.matrix_columns,
-                )
-                for batch_index in range(compute_view.batch_size)
-                for group_index in range(compute_view.column_groups)
-            )
+            matrices = compute_view.matrices
         return _MuonParameterLayout(
             fqn=fqn,
             global_storage_shape=global_storage_shape,
@@ -232,20 +207,37 @@ class _MuonLayoutPlanner:
         for matrix_index, group_rank in enumerate(owner_group_ranks):
             matrix_indices_by_rank[group_rank].append(matrix_index)
         matrix_rows, matrix_columns = layout.matrices[0].tensor_shape
-        compute = tuple(
-            _MatrixPartition(
-                group_rank=group_rank,
-                matrix_indices=tuple(matrix_indices),
-                tensor_shape=(
-                    torch.Size((len(matrix_indices), matrix_rows, matrix_columns))
-                    if layout.is_batched
-                    else torch.Size(
-                        (matrix_rows if matrix_indices else 0, matrix_columns)
-                    )
-                ),
+        partitions = []
+        for group_rank, matrix_indices in enumerate(matrix_indices_by_rank):
+            indices_by_shape: dict[torch.Size, list[int]] = {}
+            for index in matrix_indices:
+                shape = layout.matrices[index].tensor_shape
+                indices_by_shape.setdefault(shape, []).append(index)
+            ordered_indices = []
+            groups = []
+            offset = 0
+            for shape, indices in indices_by_shape.items():
+                group_shape = (
+                    torch.Size((len(indices), *shape)) if layout.is_batched else shape
+                )
+                groups.append(_MatrixComputeGroup(offset, group_shape))
+                ordered_indices.extend(indices)
+                offset += group_shape.numel()
+            if len(groups) == 1:
+                tensor_shape = groups[0].tensor_shape
+            elif groups:
+                tensor_shape = torch.Size((offset,))
+            else:
+                tensor_shape = torch.Size(
+                    (0, matrix_rows, matrix_columns)
+                    if layout.is_batched else (0, matrix_columns)
+                )
+            partitions.append(
+                _MatrixPartition(
+                    group_rank, tuple(ordered_indices), tensor_shape, tuple(groups)
+                )
             )
-            for group_rank, matrix_indices in enumerate(matrix_indices_by_rank)
-        )
+        compute = tuple(partitions)
         routes = self._build_matrix_routes(layout, compute, owner_group_ranks)
         self._validate_routes(layout, compute, routes)
         # A shape-only view needs no transfer when every element stays at its

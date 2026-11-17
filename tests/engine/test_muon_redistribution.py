@@ -10,13 +10,13 @@ from torchturbo.engine.backends.fsdp2.optimizers.muon_layout import (
     _MatrixPartition,
     _MatrixRoute,
     _MuonLayoutPlanner,
-    _MuonMatrix,
     _MuonParameterLayout,
     _RowPartition,
     _StorageToComputePlan,
 )
 from torchturbo.engine.optimizers.muon import (
     BatchedMatrixComputeView,
+    MatrixRegion,
     ResolvedBatchedMatrixView,
 )
 from torchturbo.utils.torch_utils import torch_version
@@ -177,10 +177,10 @@ def test_resolve_parameter_describes_independent_matrices_before_assignment():
     assert layout.global_storage_shape == (6, 8)
     assert layout.is_batched
     assert layout.matrices == (
-        _MuonMatrix(0, 0, 0, 3, 4),
-        _MuonMatrix(1, 0, 4, 3, 4),
-        _MuonMatrix(2, 3, 0, 3, 4),
-        _MuonMatrix(3, 3, 4, 3, 4),
+        MatrixRegion(0, 0, 0, 3, 4),
+        MatrixRegion(1, 0, 4, 3, 4),
+        MatrixRegion(2, 3, 0, 3, 4),
+        MatrixRegion(3, 3, 4, 3, 4),
     )
     assert all(matrix.numel == 12 for matrix in layout.matrices)
     assert all(matrix.tensor_shape == (3, 4) for matrix in layout.matrices)
@@ -190,7 +190,7 @@ def test_resolve_parameter_describes_independent_matrices_before_assignment():
         local_storage_shape=torch.Size((2, 8)),
     )
     assert not owned.is_batched
-    assert owned.matrices == (_MuonMatrix(0, 0, 0, 6, 8),)
+    assert owned.matrices == (MatrixRegion(0, 0, 0, 6, 8),)
 
 
 @pytest.mark.parametrize("num_ranks", [1, 4, 8])

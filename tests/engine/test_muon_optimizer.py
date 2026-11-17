@@ -27,6 +27,7 @@ from torchturbo.engine.optimizers import (
     OptimizersContainer,
     Owned,
     ParamGroup,
+    RowSplitComputeView,
     collect_module_muon_specs,
 )
 from torchturbo.engine.backends.fsdp2.config import CPUOffloadConfig
@@ -3048,7 +3049,7 @@ class _Attention(nn.Module):
         super().__init__()
         self.q_a_proj = nn.Linear(hidden_size, 3, bias=False)
         self.q_b_proj = nn.Linear(3, num_heads * 2, bias=False)
-        self.kv_a_proj_with_mqa = nn.Linear(hidden_size, 3, bias=False)
+        self.kv_a_proj_with_mqa = nn.Linear(hidden_size, 4, bias=False)
         self.kv_b_proj = nn.Linear(3, num_heads * 2, bias=False)
         self.o_proj = nn.Linear(num_heads * 2, hidden_size, bias=False)
 
@@ -3125,7 +3126,8 @@ def _kimi_recipe_model():
                     hidden_size=hidden_size,
                     moe_intermediate_size=ffn_size,
                     first_k_dense_replace=1,
-                    q_lora_rank=hidden_size,
+                    q_lora_rank=3,
+                    kv_lora_rank=3,
                     qk_nope_head_dim=1,
                     qk_rope_head_dim=1,
                     v_head_dim=1,
@@ -3271,7 +3273,7 @@ def test_kimi_recipe_annotates_only_special_parameters():
     q_b = plan.parameter_specs[
         "language_model.model.layers.0.self_attn.q_b_proj.weight"
     ]
-    assert isinstance(q_b.compute_view, AttentionPerHeadComputeView)
+    assert q_b.compute_view == RowSplitComputeView(2, (1, 1))
     assert q_b.compute_placement == Shard(0)
 
     weight1 = plan.parameter_specs[
@@ -3307,6 +3309,7 @@ def test_kimi_recipe_annotates_only_special_parameters():
     assert tuple(recipe.parameter_overrides) == (
         "language_model.model.layers.*.self_attn.q_b_proj.weight",
         "language_model.model.layers.*.self_attn.kv_b_proj.weight",
+        "language_model.model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
         "vision_tower.**",
         "mm_projector.**",
     )
@@ -3436,7 +3439,7 @@ def test_kimi_recipe_resolves_trainable_peft_base_layer_names():
         "language_model.model.layers.0.self_attn.q_b_proj.base_layer.weight",
     )
     spec = plan.parameter_specs[plan.muon_fqns[0]]
-    assert isinstance(spec.compute_view, AttentionPerHeadComputeView)
+    assert spec.compute_view == RowSplitComputeView(2, (1, 1))
 
 
 def test_kimi_recipe_matches_modules_to_save_with_any_adapter_name():
@@ -3459,7 +3462,7 @@ def test_kimi_recipe_matches_modules_to_save_with_any_adapter_name():
     )
     assert plan.muon_fqns == (fqn,)
     spec = plan.parameter_specs[fqn]
-    assert isinstance(spec.compute_view, AttentionPerHeadComputeView)
+    assert spec.compute_view == RowSplitComputeView(2, (1, 1))
     assert spec.compute_placement == Shard(0)
 
 
@@ -3480,10 +3483,7 @@ def test_kimi_recipe_reaches_parameters_through_outer_peft_prefix():
         "base_model.model.language_model.model.layers.0."
         "self_attn.q_b_proj.weight"
     )
-    assert isinstance(
-        plan.parameter_specs[fqn].compute_view,
-        AttentionPerHeadComputeView,
-    )
+    assert plan.parameter_specs[fqn].compute_view == RowSplitComputeView(2, (1, 1))
 
 
 def test_kimi_recipe_leaves_unknown_trainable_matrix_on_default_path():

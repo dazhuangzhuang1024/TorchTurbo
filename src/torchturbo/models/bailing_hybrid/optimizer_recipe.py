@@ -12,6 +12,7 @@ from torchturbo.engine.optimizers import (
     MuonParameterOverride,
     MuonParameterSpec,
     MuonRecipe,
+    RowSplitComputeView,
 )
 
 from .modeling_bailing_moe_v3 import (
@@ -26,7 +27,7 @@ def get_muon_recipe(model: nn.Module) -> MuonRecipe:
     MLA and KDA layers sit behind the same ``attention`` attribute and reuse
     projection names for differently shaped weights: MLA ``g_proj`` holds one
     scalar per head where KDA ``g_proj`` holds a full head_dim block. Entries
-    therefore name exact layers instead of matching ``layers.*``. 
+    therefore name exact layers instead of matching ``layers.*``.
     """
     per_head = MuonParameterSpec(
         compute_placement=Shard(0),
@@ -34,14 +35,31 @@ def get_muon_recipe(model: nn.Module) -> MuonRecipe:
             int(model.config.num_attention_heads)
         ),
     )
-    # Rows of a per-head projection form one contiguous block per head, and each
-    # block is one Muon matrix. The excluded projections hold a single scalar per
-    # head, so their rows carry no matrix for Newton-Schulz.
+    config = model.config
+    mla_query = MuonParameterSpec(
+        compute_placement=Shard(0),
+        compute_view=RowSplitComputeView(
+            config.num_attention_heads, (config.qk_nope_head_dim, config.qk_rope_head_dim)
+        ),
+    )
+    mla_kv = MuonParameterSpec(
+        compute_placement=Shard(0),
+        compute_view=RowSplitComputeView(
+            config.num_attention_heads, (config.qk_nope_head_dim, config.v_head_dim)
+        ),
+    )
+    mla_kv_down = MuonParameterSpec(
+        compute_placement=Shard(0),
+        compute_view=RowSplitComputeView(1, (config.kv_lora_rank, config.qk_rope_head_dim)),
+    )
+    # MLA components are independent matrices; KDA keeps one matrix per head.
+    # Scalar gates have no matrix for Newton-Schulz.
     query_projection = "q_proj" if model.config.q_lora_rank is None else "q_b_proj"
     specs_by_attention_type = {
         BailingMoeV3MultiLatentAttention: {
-            f"{query_projection}.weight": per_head,
-            "kv_b_proj.weight": per_head,
+            f"{query_projection}.weight": mla_query,
+            "kv_b_proj.weight": mla_kv,
+            "kv_a_proj_with_mqa.weight": mla_kv_down,
             "g_proj.weight": ExcludeFromMuon(),
         },
         BailingMoeV3KimiDeltaAttention: {

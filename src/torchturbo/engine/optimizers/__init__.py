@@ -14,6 +14,7 @@ from .muon import (
     MuonRecipe,
     MuonSpecProvider,
     Owned,
+    RowSplitComputeView,
 )
 from .container import OptimizersContainer
 from .qk_clip import MLAQKClipSpec, QKClipPlan, QKClipSpec
@@ -39,6 +40,7 @@ __all__ = [
     "MuonRecipe",
     "MuonSpecProvider",
     "Owned",
+    "RowSplitComputeView",
     "OptimizerClassPlan",
     "OptimizerPlan",
     "OptimizerRecipe",

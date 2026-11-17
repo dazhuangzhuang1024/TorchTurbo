@@ -177,6 +177,19 @@ Muon supports `full` and `optimizer` CPU offload, and
 `optimizer_memory_fraction=0` selects CPU Newton-Schulz and CPU exchange. These
 paths are experimental until they are fully validated.
 
+The Muon recipes for Bailing V3 hybrid, Bailing V3 VL, and Kimi K2.5 split
+MLA projections into independent matrices: Q-NoPE and Q-RoPE within each
+query head, K-NoPE and V within each KV head, and latent rows and shared
+K-RoPE rows in the KV down projection. Each matrix uses its own Newton-Schulz
+normalization and shape-based learning rate. This matches Megatron's
+single-parameter `muon_split_head=True` splitting semantics while retaining
+TorchTurbo's momentum and Newton-Schulz implementation.
+
+These layouts apply automatically when Muon is selected. Parameter names and
+momentum storage stay unchanged, so existing optimizer checkpoints can be
+loaded; subsequent MLA updates use the new component splits. KDA, expert,
+gate, and QK clipping policies retain their existing behavior.
+
 To register a LlamaFactory template for a model, add an `lf_template.py` file to the model directory. When an adapter is activated, it scans registered models and automatically calls the corresponding `register()` function.
 
 ## Quick Start
